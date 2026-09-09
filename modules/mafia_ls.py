@@ -9,6 +9,7 @@ import html
 import logging
 import random
 import re
+import time
 import traceback
 
 
@@ -227,12 +228,39 @@ def add_game_group(gid):
 
 
 
-async def _join_game(client, param=None):
+# Мафия-бот постоянно РЕДАКТИРУЕТ свои сообщения (счётчики, таймеры, ростер),
+# а обработчики висят и на новых, и на отредактированных сообщениях.
+# Без защиты это даёт повторные /start и клики — поэтому дедуп по кулдауну.
+_JOIN_COOLDOWN = 600  # сек: не слать один и тот же /start чаще
+_CLICK_TTL = 300  # сек: не жать одну и ту же кнопку на том же сообщении
+
+
+def _join_history():
+    data = db.get("custom.mafia_ls", "join_history", {})
+    return data if isinstance(data, dict) else {}
+
+
+def _click_history():
+    data = db.get("custom.mafia_ls", "click_history", {})
+    return data if isinstance(data, dict) else {}
+
+
+async def _join_game(client, param=None, force=False):
     target = param or get_last_start()
     if not target:
         return
+    now = time.time()
+    history = {
+        k: v for k, v in _join_history().items()
+        if now - float(v) < _JOIN_COOLDOWN
+    }
+    if not force and target in history:
+        _dbg(f"скип повторного /start {target} (уже входили, cooldown {_JOIN_COOLDOWN}с)")
+        return
     try:
         await client.send_message(MAFIA_BOT, f"/start {target}")
+        history[target] = now
+        db.set("custom.mafia_ls", "join_history", history)
         _dbg(f"отправлен /start {target} боту {MAFIA_BOT}")
         await _log_to_chat(client, "Вход в игру", f"Отправлен <code>/start {html.escape(target)}</code> боту @{MAFIA_BOT}")
     except Exception as e:
@@ -452,6 +480,24 @@ def _find_slot_for_target(target_id, roster):
 
 async def _force_click(client, message, button_text, callback_data, reason="Клик"):
     raw_cb_str = callback_data.decode("utf-8", "ignore") if isinstance(callback_data, bytes) else str(callback_data)
+
+    # Дедуп: то же сообщение + та же кнопка. Мафия-бот любит редактировать
+    # сообщения (таймеры, счётчики) — без этого клик повторялся на каждый edit.
+    # Охота не страдает: каждый раунд — новое сообщение с другим msg_id.
+    now = time.time()
+    clicks = {
+        k: v for k, v in _click_history().items()
+        if now - float(v) < _CLICK_TTL
+    }
+    click_key = f"{message.chat.id}:{message.id}:{raw_cb_str}"
+    if click_key in clicks:
+        _dbg(f"скип повторного клика {button_text!r} (msg {message.id})")
+        return True
+
+    def _remember_click():
+        clicks[click_key] = now
+        db.set("custom.mafia_ls", "click_history", clicks)
+
     details = (
         f"🔘 <b>Кнопка:</b> <code>{html.escape(button_text)}</code>\n"
         f"📦 <b>Callback:</b> <code>{html.escape(raw_cb_str)}</code>\n"
@@ -462,6 +508,7 @@ async def _force_click(client, message, button_text, callback_data, reason="Кл
 
     try:
         await message.click(button_text)
+        _remember_click()
         _dbg(f"клик через message.click: {button_text!r}")
         await _log_to_chat(client, "Нажата кнопка (message.click)", details)
         return True
@@ -475,6 +522,7 @@ async def _force_click(client, message, button_text, callback_data, reason="Кл
         await client.invoke(
             functions.messages.GetBotCallbackAnswer(peer=peer, msg_id=message.id, data=c_data)
         )
+        _remember_click()
         _dbg(f"клик через raw API: {button_text!r}")
         await _log_to_chat(client, "Нажата кнопка (Raw API)", details)
         return True
@@ -806,7 +854,7 @@ async def mafia_last_join(client, message):
     lt = get_last_start()
     if lt:
         await message.edit("<b>⏳ Пробуем войти в последнюю игру...</b>")
-        await _join_game(client, lt)
+        await _join_game(client, lt, force=True)
     else:
         await message.edit("<b>❌ Ссылка на игру не сохранена. Дождись набора в чате!</b>")
     await asyncio.sleep(2)
@@ -876,11 +924,7 @@ async def mafia_ls_handler(client, message):
             m = _find_link(message)
             if m:
                 set_last_start(m.group(1))
-                try:
-                    await client.send_message(MAFIA_BOT, f"/start {m.group(1)}")
-                    await _log_to_chat(client, "Вход из рекрута (ЛС)", f"Отправлен /start <code>{html.escape(m.group(1))}</code>")
-                except Exception as e:
-                    _dbg(f"join from recruit fail: {e}")
+                await _join_game(client, m.group(1))
                 return
 
 
