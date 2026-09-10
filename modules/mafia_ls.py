@@ -13,7 +13,7 @@ import time
 import traceback
 
 
-from pyrogram import Client, filters
+from pyrogram import Client, ContinuePropagation, filters
 from pyrogram.raw import functions
 
 
@@ -878,14 +878,20 @@ async def mafia_set_group(client, message):
 
 @Client.on_message(_OWNER_FILTER & filters.text)
 async def mafia_autolink(client, message):
+    # Этот хендлер ловит ВСЕ текстовые сообщения владельца, включая команды
+    # (.ping, .restart и т.д.). Без ContinuePropagation он глушит все модули,
+    # загруженные после mafia_ls, поэтому всегда отдаём управление дальше.
     try:
         m = _find_link(message)
         if not m:
-            return
+            raise ContinuePropagation
         set_last_start(m.group(1))
         await _join_game(client, m.group(1))
+    except ContinuePropagation:
+        raise
     except Exception as e:
         await _log_to_chat(client, "Ошибка mafia_autolink", exc=e, is_error=True)
+    raise ContinuePropagation
 
 
 
@@ -901,7 +907,7 @@ async def mafia_autolink(client, message):
 @Client.on_edited_message(filters.private & ~filters.me)
 async def mafia_ls_handler(client, message):
     if not _is_from_mafia_bot(message):
-        return
+        raise ContinuePropagation
 
 
     try:
@@ -911,7 +917,7 @@ async def mafia_ls_handler(client, message):
 
 
         if GAME_END_RE.search(text):
-            return
+            raise ContinuePropagation
 
 
         # Набор в игру в ЛС
@@ -920,12 +926,12 @@ async def mafia_ls_handler(client, message):
                 if JOIN_RE.search(bt):
                     await asyncio.sleep(random.uniform(0.3, 0.8))
                     await _force_click(client, message, bt, data, reason="Авто-вход (кнопка)")
-                    return
+                    raise ContinuePropagation
             m = _find_link(message)
             if m:
                 set_last_start(m.group(1))
                 await _join_game(client, m.group(1))
-                return
+                raise ContinuePropagation
 
 
         # Парсинг ростера (списка игроков) в личке
@@ -945,7 +951,7 @@ async def mafia_ls_handler(client, message):
 
 
         if not btns:
-            return
+            raise ContinuePropagation
 
 
         # Определение роли
@@ -966,7 +972,7 @@ async def mafia_ls_handler(client, message):
         # AFK: если цель не задана или преследование выключено — ничего не нажимаем
         if not (hunt_mode and hunt_target):
             _dbg_on("🦥 AFK: цель не задана, клики пропущены")
-            return
+            raise ContinuePropagation
 
 
         if hunt_mode and hunt_target:
@@ -1004,22 +1010,25 @@ async def mafia_ls_handler(client, message):
                 _dbg(f"🎯 клик по цели {hunt_target}: {bt!r}")
                 await asyncio.sleep(random.uniform(0.5, 1.2))
                 await _force_click(client, message, bt, data, reason=reason)
-                return
+                raise ContinuePropagation
 
 
             # Цель не найдена — не голосуем за случайного человека (AFK)
             _dbg_on(f"🦥 AFK: кнопка цели {hunt_target} не найдена, ход пропущен")
-            return
+            raise ContinuePropagation
 
 
         # Обычный режим — недоступен без цели (AFK)
         _dbg_on("🦥 AFK: нет цели, случайные клики отменены")
-        return
+        raise ContinuePropagation
 
 
+    except ContinuePropagation:
+        raise
     except Exception as e:
         _dbg(f"Ошибка в mafia_ls_handler: {e}")
         await _log_to_chat(client, "Ошибка в обработчике ЛС", exc=e, is_error=True)
+        raise ContinuePropagation
 
 
 
@@ -1035,7 +1044,7 @@ async def mafia_ls_handler(client, message):
 @Client.on_edited_message(filters.group & ~filters.me)
 async def mafia_roster_collector(client, message):
     if not _is_from_mafia_bot(message):
-        return
+        raise ContinuePropagation
 
 
     try:
@@ -1053,12 +1062,12 @@ async def mafia_roster_collector(client, message):
             if m:
                 set_last_start(m.group(1))
                 await _join_game(client, m.group(1))
-                return
+                raise ContinuePropagation
             for bt, data in btns:
                 if JOIN_RE.search(bt):
                     await asyncio.sleep(random.uniform(0.3, 0.8))
                     await _force_click(client, message, bt, data, reason="Авто-вход из группы (кнопка)")
-                    return
+                    raise ContinuePropagation
 
 
         # Парсинг ростера (списка игроков)
@@ -1080,10 +1089,14 @@ async def mafia_roster_collector(client, message):
                 f"🔢 <b>Игроков ({len(extracted_roster)}):</b>\n" + ", ".join(roster_lines)
             )
 
+        raise ContinuePropagation
 
+    except ContinuePropagation:
+        raise
     except Exception as e:
         _dbg(f"Ошибка в mafia_roster_collector: {e}")
         await _log_to_chat(client, "Ошибка в сборщике ростера", exc=e, is_error=True)
+        raise ContinuePropagation
 
 
 

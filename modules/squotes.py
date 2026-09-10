@@ -31,18 +31,41 @@ FLAGS = {"!png", "!file", "!me", "!ls", "!noreply", "!nr"}
 async def _generate_and_send_quote(
     client: Client, message, params: dict, is_png: bool, send_for_me: bool
 ):
-    async with (
-        aiohttp.ClientSession() as session,
-        session.post(QUOTES_API, json=params) as response,
-    ):
-        if response.status != 200:
-            error_text = await response.text()
-            return await message.edit(
-                f"<b>Quotes API error!</b>\n<code>{error_text}</code>"
-            )
-        content = await response.read()
+    if not QUOTES_API:
+        return await message.edit(
+            "<b>Quotes API is not configured!</b>\n"
+            "Set <code>QUOTES_API</code> env variable."
+        )
 
-    resized = resize_image(BytesIO(content), img_type="PNG" if is_png else "WEBP")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                QUOTES_API,
+                json=params,
+                timeout=aiohttp.ClientTimeout(total=90),
+            ) as response:
+                if response.status != 200:
+                    error_text = (await response.text())[:500]
+                    return await message.edit(
+                        f"<b>Quotes API error (HTTP {response.status})!</b>\n"
+                        f"<code>{error_text}</code>\n\n"
+                        "<i>The quotes server may be sleeping (free Render) — "
+                        "wait a minute and try again.</i>"
+                    )
+                content = await response.read()
+    except Exception as e:
+        return await message.edit(
+            "<b>Quotes API is unreachable!</b>\n"
+            f"<code>{e}</code>\n\n"
+            "<i>The quotes server may be down or sleeping — "
+            "wait a minute and try again.</i>"
+        )
+
+    try:
+        resized = resize_image(BytesIO(content), img_type="PNG" if is_png else "WEBP")
+    except Exception as e:
+        return await message.edit(format_exc(e))
+
     await message.edit("<b>Sending...</b>")
 
     try:

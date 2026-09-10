@@ -132,6 +132,7 @@ async def afk_set(_, message: Message):
 
 
 @Client.on_message(filters.command("afk", "!") & filters.me, group=3)
+@Client.on_message(filters.command(["unafk"], prefix) & filters.me, group=3)
 async def afk_unset(_, message: Message):
     global AFK, AFK_TIME, AFK_REASON, USERS, GROUPS
 

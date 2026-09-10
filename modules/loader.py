@@ -25,6 +25,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 
 from utils import modules_help, prefix
+from utils.config import modules_repo_branch
 from utils.db import db
 from utils.scripts import load_module, unload_module
 
@@ -84,7 +85,7 @@ async def loadmod(client: Client, message: Message):
         url = message.command[1].lower()
 
         if url.startswith(
-            "https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/main/"
+            f"https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/{modules_repo_branch}/"
         ):
             module_name = url.split("/")[-1].split(".")[0]
         elif "." not in url:
@@ -93,7 +94,7 @@ async def loadmod(client: Client, message: Message):
                 async with (
                     aiohttp.ClientSession() as session,
                     session.get(
-                        "https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/main/full.txt"
+                        f"https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/{modules_repo_branch}/full.txt"
                     ) as resp,
                 ):
                     f = await resp.text()
@@ -103,7 +104,7 @@ async def loadmod(client: Client, message: Message):
                 line.split("/")[-1].split()[0]: line.strip() for line in f.splitlines()
             }
             if module_name in modules_dict:
-                url = f"https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/main/{modules_dict[module_name]}.py"
+                url = f"https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/{modules_repo_branch}/{modules_dict[module_name]}.py"
             else:
                 await message.edit(
                     f"<b>Module <code>{module_name}</code> is not found</b>"
@@ -163,7 +164,7 @@ async def unload_mods(client: Client, message: Message):
     module_name = message.command[1].lower()
 
     if module_name.startswith(
-        "https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/main/"
+        f"https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/{modules_repo_branch}/"
     ):
         module_name = module_name.split("/")[-1].split(".")[0]
 
@@ -200,7 +201,7 @@ async def load_all_mods(client: Client, message: Message):
         async with (
             aiohttp.ClientSession() as session,
             session.get(
-                "https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/main/full.txt"
+                f"https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/{modules_repo_branch}/full.txt"
             ) as resp,
         ):
             f = await resp.text()
@@ -211,7 +212,7 @@ async def load_all_mods(client: Client, message: Message):
     await message.edit("<b>Loading modules...</b>")
     async with aiohttp.ClientSession() as session:
         for module_name in modules_list:
-            url = f"https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/main/{module_name}.py"
+            url = f"https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/{modules_repo_branch}/{module_name}.py"
             async with session.get(url) as resp:
                 if resp.status != 200:
                     continue
@@ -274,7 +275,7 @@ async def updateallmods(client, message: Message):
                 continue
             try:
                 async with session.get(
-                    "https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/main/full.txt"
+                    f"https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/{modules_repo_branch}/full.txt"
                 ) as resp:
                     f = await resp.text()
             except Exception:
@@ -285,7 +286,7 @@ async def updateallmods(client, message: Message):
             module_name = module_file[:-3]
             if module_name in modules_dict:
                 async with session.get(
-                    f"https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/main/{modules_dict[module_name]}.py"
+                    f"https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/{modules_repo_branch}/{modules_dict[module_name]}.py"
                 ) as resp:
                     if resp.status != 200:
                         continue

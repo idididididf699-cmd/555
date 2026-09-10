@@ -31,20 +31,31 @@ async def sg(client: Client, message: Message):
     else:
         await message.edit(f"<b>Usage: </b><code>{prefix}sgb [id]</code>")
         return
+    # Пробуем несколько юзернеймов — бета-бот часто лежит или переименован
+    bot_usernames = ["@SangMata_beta_bot", "@SangMata_bot", "@SangMataInfo_bot"]
+    last_error = None
     try:
         await message.edit("<code>Processing please wait</code>")
-        bot_username = "@SangMata_beta_bot"
-        async with Conversation(client, bot_username, timeout=15) as conv:
-            await conv.send_message(str(user_id))
-            response = await conv.get_response(timeout=10)
-            if "you have used up your quota" in response.text:
-                await message.edit(response.text.splitlines()[0])
-                return
-            return await message.edit(response.text)
-    except YouBlockedUser:
-        await message.edit("<i>Please unblock @SangMata_beta_bot first.</i>")
-    except TimeoutError:
-        await message.edit("<i>No response from bot within the timeout period.</i>")
+        for bot_username in bot_usernames:
+            try:
+                async with Conversation(client, bot_username, timeout=15) as conv:
+                    await conv.send_message(str(user_id))
+                    response = await conv.get_response(timeout=10)
+                    if "you have used up your quota" in response.text:
+                        await message.edit(response.text.splitlines()[0])
+                        return
+                    return await message.edit(response.text)
+            except YouBlockedUser:
+                return await message.edit(
+                    f"<i>Please unblock {bot_username} first.</i>"
+                )
+            except (TimeoutError, Exception) as e:
+                last_error = e
+                continue
+        if isinstance(last_error, TimeoutError):
+            await message.edit("<i>No response from bot within the timeout period.</i>")
+        else:
+            await message.edit(f"<i>Error: {format_exc(last_error)}</i>")
     except Exception as e:
         await message.edit(f"<i>Error: {format_exc(e)}</i>")
 

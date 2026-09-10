@@ -31,7 +31,7 @@ async def scan_my_file(_, message: Message):
             "`Please Reply To File To Scan For Viruses`",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
-    if vak is None:
+    if not vak:
         return await ms_.edit(
             "`You Need To Set VIRUSTOTAL_API_KEY For Functing Of This Plugin.`",
             parse_mode=enums.ParseMode.MARKDOWN,
@@ -83,7 +83,7 @@ async def scan_my_large_file(_, message: Message):
             "`Please Reply To File To Scan For Viruses`",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
-    if vak is None:
+    if not vak:
         return await ms_.edit(
             "`You Need To Set VIRUSTOTAL_API_KEY For Functing Of This Plugin.`",
             parse_mode=enums.ParseMode.MARKDOWN,

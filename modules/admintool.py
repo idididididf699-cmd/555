@@ -78,7 +78,10 @@ def format_welcome_text(raw_text: str, user, chat) -> str:
     return text
 
 
-@Client.on_message(filters.group | filters.channel & ~filters.me)
+# ВАЖНО: скобки обязательны! Без них `&` привязывается только к filters.channel
+# и хендлер ловит в том числе СВОИ сообщения (при включённом antiraid
+# удалял собственные команды и пытался забанить самого себя).
+@Client.on_message((filters.group | filters.channel) & ~filters.me)
 async def admintool_handler(_, message: Message):
     if message.sender_chat and (
         message.sender_chat.type == "supergroup"

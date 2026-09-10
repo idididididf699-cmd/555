@@ -16,7 +16,7 @@
 
 import os
 
-from pyrogram import Client, filters
+from pyrogram import Client, ContinuePropagation, filters
 from pyrogram.raw import functions
 from pyrogram.types import Message
 
@@ -28,9 +28,17 @@ anti_pm_enabled = filters.create(
     lambda _, __, ___: db.get("core.antipm", "status", False)
 )
 
-in_contact_list = filters.create(lambda _, __, message: message.from_user.is_contact)
+in_contact_list = filters.create(
+    lambda _, __, message: bool(
+        message.from_user and message.from_user.is_contact
+    )
+)
 
-is_support = filters.create(lambda _, __, message: message.chat.is_support)
+is_support = filters.create(
+    lambda _, __, message: bool(
+        message.chat and getattr(message.chat, "is_support", False)
+    )
+)
 
 USER_WARNINGS = {}
 
@@ -95,6 +103,9 @@ Do not spam further messages else I may have to block you!</i>
             )
             await client.block_user(user_id)
             del USER_WARNINGS[user_id]
+
+    # Не глушить остальные модули (chatbot, filters, mafia и т.д.)
+    raise ContinuePropagation
 
 
 @Client.on_message(filters.command(["antipm", "anti_pm"], prefix) & filters.me)

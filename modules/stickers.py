@@ -47,68 +47,81 @@ async def kang(client: Client, message: types.Message):
     else:
         emoji = "✨"
 
-    await client.unblock_user("@stickers")
-    await interact_with(
-        await client.send_message(
-            "@stickers", "/cancel", parse_mode=enums.ParseMode.MARKDOWN
-        )
-    )
-    await interact_with(
-        await client.send_message(
-            "@stickers", "/addsticker", parse_mode=enums.ParseMode.MARKDOWN
-        )
-    )
-
-    result = await interact_with(
-        await client.send_message(
-            "@stickers", pack, parse_mode=enums.ParseMode.MARKDOWN
-        )
-    )
-    if ".TGS" in result.text:
-        await message.edit("<b>Animated packs aren't supported</b>")
-        return
-    if "StickerExample.psd" not in result.text:
-        await message.edit(
-            "<b>Stickerpack doesn't exitst. Create it using @Stickers bot (via /newpack command)</b>",
-        )
-        return
-
     try:
-        path = await message.reply_to_message.download()
-    except ValueError:
-        await message.edit(
-            "<b>Replied message doesn't contain any downloadable media</b>",
-        )
-        return
-
-    resized = resize_image(path)
-    if os.path.exists(path):
-        os.remove(path)
-
-    await interact_with(
-        await client.send_document(
-            "@stickers", resized, parse_mode=enums.ParseMode.MARKDOWN
-        )
-    )
-    response = await interact_with(
-        await client.send_message(
-            "@stickers", emoji, parse_mode=enums.ParseMode.MARKDOWN
-        )
-    )
-    if "/done" in response.text:
-        # ok
+        await client.unblock_user("@stickers")
         await interact_with(
             await client.send_message(
-                "@stickers", "/done", parse_mode=enums.ParseMode.MARKDOWN
+                "@stickers", "/cancel", parse_mode=enums.ParseMode.MARKDOWN
             )
         )
-        await client.delete_messages("@stickers", interact_with_to_delete)
-        await message.edit(
-            f"<b>Sticker added to <a href=https://t.me/addstickers/{pack}>pack</a></b>",
+        await interact_with(
+            await client.send_message(
+                "@stickers", "/addsticker", parse_mode=enums.ParseMode.MARKDOWN
+            )
         )
-    else:
-        await message.edit("<b>Something went wrong. Check history with @stickers</b>")
-    interact_with_to_delete.clear()
+
+        result = await interact_with(
+            await client.send_message(
+                "@stickers", pack, parse_mode=enums.ParseMode.MARKDOWN
+            )
+        )
+        if ".TGS" in (result.text or ""):
+            await message.edit("<b>Animated packs aren't supported</b>")
+            return
+        if "StickerExample.psd" not in (result.text or ""):
+            await message.edit(
+                "<b>Stickerpack doesn't exist. Create it using @Stickers bot (via /newpack command)</b>",
+            )
+            return
+
+        try:
+            path = await message.reply_to_message.download()
+        except ValueError:
+            await message.edit(
+                "<b>Replied message doesn't contain any downloadable media</b>",
+            )
+            return
+
+        resized = resize_image(path)
+        if os.path.exists(path):
+            os.remove(path)
+
+        await interact_with(
+            await client.send_document(
+                "@stickers", resized, parse_mode=enums.ParseMode.MARKDOWN
+            )
+        )
+        response = await interact_with(
+            await client.send_message(
+                "@stickers", emoji, parse_mode=enums.ParseMode.MARKDOWN
+            )
+        )
+        if "/done" in (response.text or ""):
+            # ok
+            await interact_with(
+                await client.send_message(
+                    "@stickers", "/done", parse_mode=enums.ParseMode.MARKDOWN
+                )
+            )
+            try:
+                await client.delete_messages("@stickers", interact_with_to_delete)
+            except Exception:
+                pass
+            await message.edit(
+                f"<b>Sticker added to <a href=https://t.me/addstickers/{pack}>pack</a></b>",
+            )
+        else:
+            await message.edit("<b>Something went wrong. Check history with @stickers</b>")
+    except RuntimeError as e:
+        # interact_with: @stickers не ответил за 5 секунд
+        await message.edit(
+            f"<b>@stickers didn't answer:</b> <code>{e}</code>\n"
+            "<i>Try again in a minute — official bots are often slow.</i>"
+        )
+    except Exception as e:
+        await message.edit(format_exc(e))
+    finally:
+        interact_with_to_delete.clear()
 
 
 @Client.on_message(filters.command(["stp", "s2p", "stick2png"], prefix) & filters.me)

@@ -72,6 +72,8 @@ async def openfile(client: Client, message: Message):
     if not message.reply_to_message:
         return await message.edit_text("Kindly Reply to a File")
 
+    file_path = None
+    ms = message
     try:
         ms = await edit_or_reply(message, "<b>Downloading...</b>")
         ct = time.time()
@@ -117,7 +119,7 @@ async def openfile(client: Client, message: Message):
         await ms.edit_text(format_exc(e))
 
     finally:
-        if os.path.exists(file_path):
+        if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
 

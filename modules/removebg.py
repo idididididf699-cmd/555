@@ -167,6 +167,7 @@ async def rmbg(client: Client, message: Message):
 async def rembg(client: Client, message: Message):
     await message.edit("<code>Processing...</code>")
     chat_id = message.chat.id
+    photo_data = None
     try:
         try:
             photo_data = await message.download()
@@ -191,7 +192,7 @@ async def rembg(client: Client, message: Message):
     except Exception as e:
         await message.reply_text(f"An error occurred: {format_exc(e)}")
     finally:
-        if os.path.exists(photo_data):
+        if photo_data and os.path.exists(photo_data):
             os.remove(photo_data)
 
 
