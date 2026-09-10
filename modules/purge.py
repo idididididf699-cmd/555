@@ -24,6 +24,7 @@ from utils.scripts import with_reply
 
 
 @Client.on_message(filters.command("del", prefix) & filters.me)
+@with_reply
 async def del_msg(_, message: Message):
     await message.delete()
     await message.reply_to_message.delete()

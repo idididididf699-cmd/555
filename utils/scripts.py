@@ -301,7 +301,7 @@ async def interact_with(message: Message) -> Message:
     ]
     seconds_waiting = 0
 
-    while response[0].from_user.is_self:
+    while response and response[0].from_user and response[0].from_user.is_self:
         seconds_waiting += 1
         if seconds_waiting >= 5:
             raise RuntimeError("bot didn't answer in 5 seconds")
@@ -312,6 +312,9 @@ async def interact_with(message: Message) -> Message:
             msg
             async for msg in message._client.get_chat_history(message.chat.id, limit=1)
         ]
+
+    if not response:
+        raise RuntimeError("bot didn't answer (empty history)")
 
     interact_with_to_delete.append(message.id)
     interact_with_to_delete.append(response[0].id)

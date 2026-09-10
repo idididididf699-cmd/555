@@ -17,31 +17,58 @@
 import asyncio
 
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
 from utils import modules_help, prefix
+from utils.scripts import format_exc
 
 commands = ["spam", "statspam", "slowspam", "fastspam"]
 
 
 @Client.on_message(filters.command(commands, prefix) & filters.me)
 async def spam(client: Client, message: Message):
-    amount = int(message.command[1])
+    if len(message.command) < 3:
+        return await message.edit(
+            f"<b>Usage:</b> <code>{prefix}{message.command[0]} [amount 1-100] [text]</code>"
+        )
+
+    try:
+        amount = int(message.command[1])
+    except ValueError:
+        return await message.edit("<b>Amount must be a number!</b>")
+
+    amount = max(1, min(amount, 100))
     text = " ".join(message.command[2:])
+
+    if not text.strip():
+        return await message.edit("<b>Text to spam is empty!</b>")
 
     cooldown = {"spam": 0.15, "statspam": 0.1, "slowspam": 0.9, "fastspam": 0}
 
     await message.delete()
 
     for _msg in range(amount):
-        if message.reply_to_message:
-            sent = await message.reply_to_message.reply(text)
-        else:
-            sent = await client.send_message(message.chat.id, text)
+        try:
+            if message.reply_to_message:
+                sent = await message.reply_to_message.reply(text)
+            else:
+                sent = await client.send_message(message.chat.id, text)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+            continue
+        except Exception as e:
+            await client.send_message(
+                message.chat.id, f"<b>Spam stopped:</b>\n{format_exc(e)}"
+            )
+            break
 
         if message.command[0] == "statspam":
             await asyncio.sleep(0.1)
-            await sent.delete()
+            try:
+                await sent.delete()
+            except Exception:
+                pass
 
         await asyncio.sleep(cooldown[message.command[0]])
 

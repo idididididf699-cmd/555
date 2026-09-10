@@ -17,11 +17,20 @@
 import datetime
 import random
 
+import aiohttp
 from dulwich.refs import Ref
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
 from utils import gitrepo, modules_help, prefix, python_version, userbot_version
+from utils.config import (
+    db_type,
+    owner_id,
+    quotes_api,
+    rmbg_key,
+    vt_key,
+)
+from utils.module import ModuleManager
 
 
 @Client.on_message(filters.command(["support", "repo"], prefix) & filters.me)
@@ -29,10 +38,7 @@ async def support(_, message: Message):
     devs = ["@Qbtaumai", "@H4T3H46K3R"]
     random.shuffle(devs)
 
-    commands_count = 0.0
-    for module in modules_help:
-        for _cmd in module:
-            commands_count += 1
+    commands_count = sum(len(commands) for commands in modules_help.values())
 
     await message.edit(
         f"<b>Moon-Userbot\n\n"
@@ -111,7 +117,70 @@ async def version(client: Client, message: Message):
     )
 
 
+@Client.on_message(filters.command(["doctor", "diag"], prefix) & filters.me)
+async def doctor(client: Client, message: Message):
+    """Самодиагностика: почему что-то может не работать."""
+    await message.edit("<b>🩺 Diagnosing... (it'll take a few seconds)</b>")
+
+    manager = ModuleManager.get_instance()
+    me = await client.get_me()
+
+    # --- AI key (chatbot) ---
+    try:
+        from modules.chatbot import get_ai_key  # lazy: порядок загрузки модулей
+
+        ai_key_ok = bool(get_ai_key())
+    except Exception:
+        ai_key_ok = False
+
+    # --- Quotes API ---
+    quotes_status = "❌ not set"
+    if quotes_api:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://quotes-o042.onrender.com/",
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    quotes_status = (
+                        "✅ reachable" if resp.status < 500 else f"⚠️ HTTP {resp.status}"
+                    )
+        except Exception as e:
+            quotes_status = f"❌ unreachable ({type(e).__name__})"
+
+    owner_ok = (me.id == int(owner_id)) if owner_id else False
+
+    lines = [
+        "<b>🩺 Doctor report</b>",
+        "",
+        f"• Prefix: <code>{prefix}</code>",
+        f"• Me: <code>{me.id}</code> (@{me.username or 'no_username'})",
+        f"• OWNER_ID: <code>{owner_id}</code> "
+        + ("✅ match" if owner_ok else "⚠️ MISMATCH — mafia autolink won't work!"),
+        f"• Database: <code>{db_type}</code>",
+        f"• Modules loaded: <b>{len(modules_help)}</b> "
+        f"(failed: <b>{manager.failed_modules}</b>)",
+    ]
+    if manager.failed_list:
+        failed = ", ".join(f"<code>{m}</code>" for m in manager.failed_list[:10])
+        lines.append(f"  ↳ failed: {failed}")
+
+    lines += [
+        "",
+        "<b>API keys / services:</b>",
+        f"• AI_KEY (chatbot): {'✅ set' if ai_key_ok else '❌ NOT SET — set via <code>.aikey</code>'}",
+        f"• RMBG_KEY (removebg): {'✅ set' if rmbg_key else '❌ not set'}",
+        f"• VT_KEY (virustotal): {'✅ set' if vt_key else '❌ not set'}",
+        f"• QUOTES_API (q): {quotes_status}",
+        "",
+        "<i>Tip: failing modules log tracebacks to moonlogs.txt "
+        f"(view with <code>{prefix}moonlogs</code>)</i>",
+    ]
+    await message.edit("\n".join(lines))
+
+
 modules_help["support"] = {
     "support": "Information about userbot",
     "version": "Check userbot version",
+    "doctor": "Self-diagnostics: keys, services, failed modules",
 }

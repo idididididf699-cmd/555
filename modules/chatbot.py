@@ -9,7 +9,7 @@ import time
 from typing import Optional, Union
 
 import aiohttp
-from pyrogram import Client, enums, filters
+from pyrogram import Client, ContinuePropagation, enums, filters
 from pyrogram.types import Message
 
 from utils import modules_help, prefix
@@ -610,19 +610,23 @@ async def _chat(prompt: str, system: str) -> str:
 
 @Client.on_message(_TRIGGER)
 async def chatbot(client: Client, message: Message):
+    # ВАЖНО: этот хендлер ловит ВСЕ входящие текстовые сообщения.
+    # Без ContinuePropagation он глушит остальные модули в группе 0
+    # (filters, antipm, mafia и т.д.), поэтому отдаём управление дальше
+    # на КАЖДОМ выходе из функции.
     key = get_ai_key()
     if not key:
-        return
+        raise ContinuePropagation
 
     if message.from_user and message.from_user.is_bot:
-        return
+        raise ContinuePropagation
 
     text = message.text or ""
     if not text.strip():
-        return
+        raise ContinuePropagation
 
     if re.search(r"t\.me/TrueMafiaBlackBot", text, re.IGNORECASE):
-        return
+        raise ContinuePropagation
 
     username_pattern = rf"@{re.escape(_OWNER_USERNAME)}\b"
 
@@ -637,7 +641,7 @@ async def chatbot(client: Client, message: Message):
         is_mentioned = bool(re.search(username_pattern, text, re.IGNORECASE))
 
         if not (is_reply_to_me or is_mentioned):
-            return
+            raise ContinuePropagation
 
     prompt = re.sub(username_pattern, "", text, flags=re.IGNORECASE).strip()
     if not prompt:
@@ -701,7 +705,10 @@ async def chatbot(client: Client, message: Message):
         )
 
         await _send_log(client, log_msg)
+        raise ContinuePropagation
 
+    except ContinuePropagation:
+        raise
     except Exception as e:
         log.exception("AI request failed")
         error_msg = (
@@ -713,6 +720,7 @@ async def chatbot(client: Client, message: Message):
             f"<code>{html.escape(str(e))}</code>"
         )
         await _send_log(client, error_msg)
+        raise ContinuePropagation
 
 
 # ============================================================
