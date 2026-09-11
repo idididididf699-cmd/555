@@ -1,6 +1,7 @@
 # Chatbot module: AI — управление через Telegram
 # Ключ, модели, URL, характер, чеченский словарь и рабочее логирование.
 
+import asyncio
 import html
 import logging
 import os
@@ -9,7 +10,7 @@ import time
 from typing import Optional, Union
 
 import aiohttp
-from pyrogram import Client, ContinuePropagation, enums, filters
+from pyrogram import Client, enums, filters
 from pyrogram.types import Message
 
 from utils import modules_help, prefix
@@ -26,7 +27,7 @@ log = logging.getLogger(__name__)
 
 
 # ============================================================
-# НАСТРОЙКИ
+# НАСТРОЙКИ ПО УМОЛЧАНИЮ
 # ============================================================
 
 _DEFAULT_MODELS = [
@@ -38,7 +39,13 @@ _DEFAULT_MODELS = [
     "openai/gpt-4o-mini",
 ]
 
-_OWNER_USERNAME = "ai_borz"
+# FIX #2, #13: Фоллбэк-имя больше НЕ используется в regex для упоминаний.
+# Если username бота отсутствует — упоминания в группах просто игнорируем.
+_FALLBACK_OWNER_USERNAME = "ai_borz"
+_DEFAULT_IGNORE_PATTERNS = [r"t\.me/(TrueMafiaBlackBot|mafiabot)"]  # FIX #6
+_DEFAULT_MAX_TOKENS = 2048  # FIX #9
+
+_session: Optional[aiohttp.ClientSession] = None
 
 
 # ============================================================
@@ -49,41 +56,34 @@ _PRESETS = {
     "default": (
         "Ты — личный ИИ-ассистент, работающий в Telegram. "
         "Твой владелец и создатель: {owner} "
-        "(юзербот @{_OWNER_USERNAME}). "
-        "Никогда не называй пользователя именем владельца. "
+        "(юзербот @{owner_username}). "
+        "Никогда не называй собеседника именем владельца. "
         "Обращайся к собеседнику нейтрально. "
         "Отвечай на том же языке, на котором написан запрос, "
-        "по делу и кратко."
+        "по делу, грамотно и кратко."
     ),
-
     "toxic": (
-        "Ты — дерзкий, высокомерный, саркастичный и грубый ассистент. "
-        "Твой владелец: {owner} "
-        "(юзербот @{_OWNER_USERNAME}). "
-        "Отвечай с насмешкой, язвительностью, лёгким презрением "
-        "и подколами, но СТРОГО БЕЗ МАТА и прямых оскорблений. "
-        "Показывай своё превосходство над собеседником, "
-        "высмеивай банальные или глупые вопросы, "
-        "но информацию по существу давай максимально точно. "
+        "Ты — дерзкий, высокомерный, саркастичный и язвительный ассистент. "
+        "Твой владелец: {owner} (юзербот @{owner_username}). "
+        "Отвечай с насмешкой, лёгким презрением и подколами, "
+        "но СТРОГО БЕЗ МАТА и прямых грубых оскорблений. "
+        "Показывай своё интеллектуальное превосходство, "
+        "высмеивай банальные вопросы, но факты давай максимально точные. "
         "Отвечай кратко и колко."
     ),
-
     "friendly": (
         "Ты — дружелюбный, тёплый и очень вежливый помощник. "
-        "Твой владелец: {owner} (юзербот @{_OWNER_USERNAME}). "
+        "Твой владелец: {owner} (юзербот @{owner_username}). "
         "Общайся позитивно, проявляй эмпатию, "
         "поддерживай собеседника и давай ясные ответы."
     ),
-
     "bro": (
         "Ты — чёткий пацан, надёжный бро и кореш. "
-        "Твой владелец: {owner} (юзербот @{_OWNER_USERNAME}). "
+        "Твой владелец: {owner} (юзербот @{owner_username}). "
         "Общайся по-простому, на 'ты', "
-        "используй уверенный уличный/пацанский сленг, "
-        "но СТРОГО БЕЗ МАТА и грубой пошлости. "
+        "используй уверенный сленг, но СТРОГО БЕЗ МАТА. "
         "Отвечай коротко, чётко и по фактам."
     ),
-
     "chechen": (
         "Ты — чеченский ИИ-ассистент. "
         "Отвечай ТОЛЬКО на чеченском языке (нохчийн мотт). "
@@ -98,34 +98,124 @@ _PRESETS = {
 
 
 # ============================================================
-# ФИЛЬТР ВХОДЯЩИХ СООБЩЕНИЙ
+# ФИЛЬТР ВХОДЯЩИХ СООБЩЕНИЙ (FIX #3)
 # ============================================================
 
+# Список префиксов юзербота: чтобы не отправлять .aikey, .che add и т.д. в модель.
+_PREFIXES = tuple(prefix) if isinstance(prefix, (list, tuple, str)) else (".",)
+
+
+def _looks_like_command(text: str) -> bool:
+    """Определяет, является ли сообщение командой юзербота."""
+    if not text:
+        return False
+    stripped = text.lstrip()
+    if not stripped:
+        return False
+    if stripped[0] not in _PREFIXES:
+        return False
+    # После префикса должен идти буквенно-цифровой символ (иначе это может быть просто точка/многоточие)
+    if len(stripped) < 2 or not (stripped[1].isalnum() or stripped[1] == "_"):
+        return False
+    return True
+
+
 _TRIGGER = (
-    filters.text
+    (filters.text | filters.caption)
     & ~filters.me
     & ~filters.bot
 )
 
-_session: Optional[aiohttp.ClientSession] = None
+
+# ============================================================
+# УТИЛИТА: безопасное чтение значения из конфига (FIX #14)
+# ============================================================
+
+def _read_cfg(value, default: str = "") -> str:
+    """
+    Безопасно читает значение из объекта конфига.
+    Возвращает пустую строку, если объект не str/int/float и не имеет .value.
+    """
+    if value is None:
+        return default
+    if isinstance(value, (str, int, float)):
+        return str(value).strip()
+    inner = getattr(value, "value", None)
+    if isinstance(inner, (str, int, float)):
+        return str(inner).strip()
+    return default
 
 
 # ============================================================
-# БАЗА ДАННЫХ
+# УПРАВЛЕНИЕ АКТИВНОСТЬЮ (GLOBAL / PER-CHAT)
+# ============================================================
+
+def is_chatbot_enabled() -> bool:
+    return bool(db.get("custom.chatbot", "enabled", True))
+
+
+def set_chatbot_enabled(value: bool):
+    db.set("custom.chatbot", "enabled", bool(value))
+
+
+def get_disabled_chats() -> list[int]:
+    """FIX #7: Очищаем и СОХРАНЯЕМ чистый список обратно в БД."""
+    disabled = db.get("custom.chatbot", "disabled_chats", [])
+    if not isinstance(disabled, list):
+        db.set("custom.chatbot", "disabled_chats", [])
+        return []
+
+    clean_list = []
+    dirty = False
+    for item in disabled:
+        try:
+            clean_list.append(int(item))
+        except (ValueError, TypeError):
+            dirty = True
+            continue
+
+    # Записываем очищенный список только если он реально изменился
+    if dirty or len(clean_list) != len(disabled):
+        db.set("custom.chatbot", "disabled_chats", clean_list)
+
+    return clean_list
+
+
+def toggle_chat_enabled(chat_id: int) -> bool:
+    disabled_chats = get_disabled_chats()
+    chat_id = int(chat_id)
+
+    if chat_id in disabled_chats:
+        disabled_chats.remove(chat_id)
+        db.set("custom.chatbot", "disabled_chats", disabled_chats)
+        return True
+    else:
+        disabled_chats.append(chat_id)
+        db.set("custom.chatbot", "disabled_chats", disabled_chats)
+        return False
+
+
+def is_chat_enabled(chat_id: int) -> bool:
+    """FIX #5: убрано дублирующее обращение к is_chatbot_enabled() снаружи."""
+    try:
+        return int(chat_id) not in get_disabled_chats()
+    except (ValueError, TypeError):
+        return True
+
+
+# ============================================================
+# КОНФИГУРАЦИЯ API И МОДЕЛЕЙ (FIX #14 применён везде)
 # ============================================================
 
 def get_ai_key() -> str:
     saved = db.get("custom.chatbot", "ai_key", None)
     if saved:
         return str(saved).strip()
-
-    value = (
+    return (
         os.getenv("AI_KEY")
         or os.getenv("ai_key")
-        or getattr(cfg_key, "value", cfg_key)
-        or ""
+        or _read_cfg(cfg_key, "")
     )
-    return str(value).strip()
 
 
 def set_ai_key(key: str):
@@ -136,14 +226,12 @@ def get_ai_base_url() -> str:
     saved = db.get("custom.chatbot", "base_url", None)
     if saved:
         return str(saved).strip().rstrip("/")
-
     value = (
         os.getenv("AI_BASE_URL")
         or os.getenv("ai_base_url")
-        or getattr(cfg_base_url, "value", cfg_base_url)
-        or "https://openrouter.ai/api/v1"
+        or _read_cfg(cfg_base_url, "https://openrouter.ai/api/v1")
     )
-    return str(value).strip().rstrip("/")
+    return value.rstrip("/")
 
 
 def set_ai_base_url(url: str):
@@ -156,11 +244,10 @@ def get_models() -> list[str]:
         db.set("custom.chatbot", "models", _DEFAULT_MODELS.copy())
         return _DEFAULT_MODELS.copy()
 
-    models = [str(model).strip() for model in saved if str(model).strip()]
+    models = [str(m).strip() for m in saved if str(m).strip()]
     if not models:
         models = _DEFAULT_MODELS.copy()
         db.set("custom.chatbot", "models", models)
-
     return models
 
 
@@ -172,14 +259,11 @@ def get_current_model() -> str:
     model = db.get("custom.chatbot", "current_model", None)
     if model:
         return str(model).strip()
-
     model = (
         os.getenv("AI_MODEL")
         or os.getenv("ai_model")
-        or getattr(cfg_model, "value", cfg_model)
-        or "dots-studio/dots-3-note-preview:free"
+        or _read_cfg(cfg_model, "dots-studio/dots-3-note-preview:free")
     )
-    model = str(model).strip()
     db.set("custom.chatbot", "current_model", model)
     return model
 
@@ -188,18 +272,65 @@ def set_current_model(model: str) -> bool:
     model = model.strip()
     if not model:
         return False
-
     models = get_models()
     if model not in models:
         models.append(model)
         save_models(models)
-
     db.set("custom.chatbot", "current_model", model)
     return True
 
 
+def get_max_tokens() -> int:
+    """FIX #9: настраиваемый лимит токенов."""
+    try:
+        val = int(db.get("custom.chatbot", "max_tokens", _DEFAULT_MAX_TOKENS))
+        return max(64, min(val, 32768))
+    except (ValueError, TypeError):
+        return _DEFAULT_MAX_TOKENS
+
+
+def set_max_tokens(value: int):
+    db.set("custom.chatbot", "max_tokens", int(value))
+
+
+def get_strip_links() -> bool:
+    """FIX #8: настройка вырезания ссылок из ответа."""
+    return bool(db.get("custom.chatbot", "strip_links", False))
+
+
+def set_strip_links(value: bool):
+    db.set("custom.chatbot", "strip_links", bool(value))
+
+
+def get_ignore_patterns() -> list[str]:
+    """FIX #6: список игнор-паттернов."""
+    saved = db.get("custom.chatbot", "ignore_patterns", None)
+    if not isinstance(saved, list):
+        db.set("custom.chatbot", "ignore_patterns", _DEFAULT_IGNORE_PATTERNS.copy())
+        return _DEFAULT_IGNORE_PATTERNS.copy()
+    return [str(x) for x in saved if str(x).strip()]
+
+
+def add_ignore_pattern(pattern: str) -> bool:
+    patterns = get_ignore_patterns()
+    if pattern in patterns:
+        return False
+    patterns.append(pattern)
+    db.set("custom.chatbot", "ignore_patterns", patterns)
+    return True
+
+
+def del_ignore_pattern(pattern: str) -> bool:
+    patterns = get_ignore_patterns()
+    if pattern not in patterns:
+        return False
+    patterns.remove(pattern)
+    db.set("custom.chatbot", "ignore_patterns", patterns)
+    return True
+
+
 # ============================================================
-# ХАРАКТЕР
+# ХАРАКТЕР И ПРОМПТЫ
 # ============================================================
 
 def get_current_preset() -> str:
@@ -230,8 +361,6 @@ def get_log_chat() -> Optional[Union[int, str]]:
     target = db.get("custom.chatbot", "log_chat", None)
     if not target:
         return None
-
-    # Приведение строки к int, если передан ID
     if isinstance(target, str):
         target_clean = target.strip()
         if target_clean.lower() == "me":
@@ -239,7 +368,6 @@ def get_log_chat() -> Optional[Union[int, str]]:
         if (target_clean.startswith("-") and target_clean[1:].isdigit()) or target_clean.isdigit():
             return int(target_clean)
         return target_clean
-
     return target
 
 
@@ -251,7 +379,6 @@ async def _send_log(client: Client, text: str):
     target = get_log_chat()
     if not target:
         return
-
     try:
         await client.send_message(
             chat_id=target,
@@ -304,32 +431,46 @@ def _get_glossary() -> list[str]:
     if not isinstance(saved, list):
         db.set("custom.chatbot", "glossary", _DEFAULT_GLOSSARY.copy())
         return _DEFAULT_GLOSSARY.copy()
-
     return [str(x).strip() for x in saved if str(x).strip()]
 
 
 def add_glossary_word(entry: str) -> bool:
+    """
+    FIX #4:
+    - Больше НЕ заменяем все = подряд, работаем только с ПЕРВЫМ разделителем.
+    - Убрали ошибочную замену ≠ → → (это была опечатка).
+    - Приоритет разделителей: → > -> > = (первое встреченное).
+    """
     entry = entry.strip()
     if not entry:
         return False
 
-    entry = entry.replace("->", "→").replace("=", "→").replace("≠", "→")
-    if "→" not in entry:
+    # Ищем первый попавшийся разделитель
+    separators = ["→", "->", "="]
+    split_pos = -1
+    used_sep = None
+    for sep in separators:
+        pos = entry.find(sep)
+        if pos != -1 and (split_pos == -1 or pos < split_pos):
+            split_pos = pos
+            used_sep = sep
+
+    if split_pos == -1 or not used_sep:
         return False
 
-    left, right = entry.split("→", 1)
-    left, right = left.strip(), right.strip()
+    left = entry[:split_pos].strip()
+    right = entry[split_pos + len(used_sep):].strip()
+
     if not left or not right:
         return False
 
-    entry = f"{left} → {right}"
+    formatted = f"{left} → {right}"
     glossary = _get_glossary()
 
-    if entry not in glossary:
-        glossary.append(entry)
+    if formatted not in glossary:
+        glossary.append(formatted)
         db.set("custom.chatbot", "glossary", glossary)
         return True
-
     return False
 
 
@@ -346,7 +487,6 @@ def del_glossary_word(entry: str) -> bool:
         parts = item.split("→", 1)
         left = parts[0].strip().lower()
         right = parts[1].strip().lower() if len(parts) > 1 else ""
-
         if entry in (item.lower(), left, right):
             continue
         result.append(item)
@@ -354,14 +494,18 @@ def del_glossary_word(entry: str) -> bool:
     if len(result) != before:
         db.set("custom.chatbot", "glossary", result)
         return True
-
     return False
 
 
 def _extract_words_from_text(text: str) -> list[str]:
+    """
+    FIX #11, #15:
+    - Работаем с cleaned везде.
+    - Добавлена поддержка формата "слово-перевод" без пробелов.
+    """
     entries = []
-    for line in text.splitlines():
-        line = line.strip()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
         if not line:
             continue
 
@@ -374,27 +518,29 @@ def _extract_words_from_text(text: str) -> list[str]:
         )
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
-        candidates = []
+        left = right = None
         if " → " in cleaned:
-            candidates.append(cleaned.split(" → ", 1))
+            left, right = cleaned.split(" → ", 1)
         elif " = " in cleaned:
-            candidates.append(cleaned.split(" = ", 1))
+            left, right = cleaned.split(" = ", 1)
         elif ": " in cleaned:
-            candidates.append(cleaned.split(": ", 1))
+            left, right = cleaned.split(": ", 1)
         else:
-            match = re.match(r"^\s*(.+?)\s+-\s+(.+?)\s*$", line)
+            # Пробуем: "word - translation"
+            match = re.match(r"^\s*(.+?)\s+-\s+(.+?)\s*$", cleaned)
             if match:
-                candidates.append((match.group(1), match.group(2)))
-
-        if not candidates:
-            continue
-
-        left, right = candidates[0]
-        left = left.strip()
-        right = re.sub(r"^\s*[—-]\s*", "", right.strip())
+                left, right = match.group(1), match.group(2)
+            else:
+                # FIX #15: fallback для "word-translation" без пробелов
+                match = re.match(r"^([^\W\d_]+)-([^\W\d_].+)$", cleaned, re.UNICODE)
+                if match:
+                    left, right = match.group(1), match.group(2)
 
         if left and right:
-            entries.append(f"{left} → {right}")
+            left = left.strip()
+            right = re.sub(r"^\s*[—-]\s*", "", right.strip())
+            if left and right:
+                entries.append(f"{left} → {right}")
 
     return entries
 
@@ -408,16 +554,13 @@ def load_glossary_from_pdf(pdf_path: str) -> tuple[int, str]:
         except ImportError:
             return (
                 0,
-                "Библиотека PyMuPDF не установлена. "
-                "Установите её командой: pip install pymupdf",
+                "Библиотека PyMuPDF не установлена.\n"
+                "Установите: <code>pip install pymupdf</code>",
             )
 
     try:
-        doc = pymupdf.open(pdf_path)
-        try:
+        with pymupdf.open(pdf_path) as doc:
             full_text = "\n".join(page.get_text() for page in doc)
-        finally:
-            doc.close()
     except Exception as e:
         return 0, f"Не удалось прочитать PDF: {e}"
 
@@ -426,54 +569,65 @@ def load_glossary_from_pdf(pdf_path: str) -> tuple[int, str]:
     for entry in entries:
         if add_glossary_word(entry):
             added += 1
-
     return added, ""
 
 
 # ============================================================
-# HTTP SESSION
+# HTTP СЕССИЯ И СИСТЕМНЫЙ ПРОМПТ
 # ============================================================
 
 async def _get_session() -> aiohttp.ClientSession:
+    """Пересоздаём сессию при смене event loop (перезапуск бота)."""
     global _session
-    if _session is None or _session.closed:
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    needs_new = (
+        _session is None
+        or _session.closed
+        or (current_loop is not None and getattr(_session, "_loop", None) is not current_loop)
+    )
+    if needs_new:
+        if _session and not _session.closed:
+            try:
+                await _session.close()
+            except Exception:
+                pass
         _session = aiohttp.ClientSession()
     return _session
 
 
-async def close_session():
-    global _session
-    if _session is not None and not _session.closed:
-        await _session.close()
-    _session = None
+def _get_owner_details(client: Optional[Client] = None) -> tuple[str, Optional[str], int]:
+    """
+    FIX #2, #13:
+    Возвращает (owner_name, username_or_None, owner_id).
+    Если у бота нет username — возвращаем None вместо фоллбэка ai_borz.
+    """
+    username: Optional[str] = None
+    owner_id = 0
+
+    if client and getattr(client, "me", None):
+        username = client.me.username or None
+        owner_id = client.me.id
+    else:
+        try:
+            owner_id = int(_read_cfg(cfg_owner_id, "0") or 0)
+        except (TypeError, ValueError):
+            owner_id = 0
+
+    owner_name = _read_cfg(cfg_owner_name, "владелец") or "владелец"
+    if "@" in owner_name:
+        owner_name = owner_name.split("@", 1)[0].strip()
+    return owner_name, username, owner_id
 
 
-# ============================================================
-# OWNER
-# ============================================================
-
-def _owner_info() -> str:
-    raw_owner = getattr(cfg_owner_name, "value", cfg_owner_name)
-    owner = str(raw_owner or "владелец").strip()
-
-    if "@" in owner:
-        owner = owner.split("@", 1)[0].strip()
-
-    raw_owner_id = getattr(cfg_owner_id, "value", cfg_owner_id)
-    try:
-        owner_id = int(raw_owner_id or 0)
-    except (TypeError, ValueError):
-        owner_id = 0
-
-    return f"{owner} (@{_OWNER_USERNAME}, ID: {owner_id})"
-
-
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
-
-def _build_system_prompt() -> str:
-    owner = _owner_info()
+def _build_system_prompt(client: Optional[Client] = None) -> str:
+    owner_name, username, owner_id = _get_owner_details(client)
+    # Для промпта фоллбэк допустим (это просто текст для модели)
+    username_for_prompt = username or _FALLBACK_OWNER_USERNAME
+    owner_info = f"{owner_name} (@{username_for_prompt}, ID: {owner_id})"
 
     if _che_enabled():
         glossary_list = _get_glossary()
@@ -485,44 +639,29 @@ def _build_system_prompt() -> str:
         return _PRESETS["chechen"].format(glossary=glossary)
 
     preset = get_current_preset()
-
     if preset == "custom":
         custom = get_custom_prompt()
         if custom:
-            try:
-                return custom.format(
-                    owner=owner,
-                    _OWNER_USERNAME=_OWNER_USERNAME,
-                )
-            except (KeyError, ValueError, IndexError):
-                return custom
-        return _PRESETS["default"].format(
-            owner=owner,
-            _OWNER_USERNAME=_OWNER_USERNAME,
-        )
+            return custom.replace("{owner}", owner_info).replace("{owner_username}", username_for_prompt)
+        preset = "default"
 
     template = _PRESETS.get(preset, _PRESETS["default"])
-    return template.format(
-        owner=owner,
-        _OWNER_USERNAME=_OWNER_USERNAME,
-    )
+    return template.format(owner=owner_info, owner_username=username_for_prompt)
 
 
 # ============================================================
-# API CHAT
+# ВЫЗОВ OPENAI-СОВМЕСТИМОГО API
 # ============================================================
 
 async def _chat(prompt: str, system: str) -> str:
     key = get_ai_key()
     if not key:
-        raise RuntimeError(
-            "AI_KEY не задан! Задайте его командой: .aikey <ваш_ключ>"
-        )
+        raise RuntimeError("AI_KEY не задан! Установите его: .aikey <ключ>")
 
     model = get_current_model()
     base_url = get_ai_base_url()
     if not base_url:
-        raise RuntimeError("AI_BASE_URL не задан.")
+        raise RuntimeError("AI_BASE_URL не задан!")
 
     headers = {
         "Authorization": f"Bearer {key}",
@@ -537,7 +676,7 @@ async def _chat(prompt: str, system: str) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": 2048,
+        "max_tokens": get_max_tokens(),  # FIX #9
     }
 
     session = await _get_session()
@@ -548,143 +687,154 @@ async def _chat(prompt: str, system: str) -> str:
             url,
             headers=headers,
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=120),
+            timeout=aiohttp.ClientTimeout(total=90),
         ) as resp:
             try:
                 data = await resp.json(content_type=None)
             except Exception:
-                response_text = await resp.text()
-                raise RuntimeError(
-                    f"Ошибка ответа API (HTTP {resp.status}): {response_text[:500]}"
-                )
+                raw_err = await resp.text()
+                raise RuntimeError(f"HTTP {resp.status}: {raw_err[:300]}")
 
             if not 200 <= resp.status < 300:
-                error_message = f"HTTP {resp.status}"
+                err_msg = f"HTTP {resp.status}"
                 if isinstance(data, dict):
-                    error_data = data.get("error")
-                    if isinstance(error_data, dict):
-                        error_message = str(
-                            error_data.get("message", error_message)
-                        )
-                    elif error_data:
-                        error_message = str(error_data)
+                    err = data.get("error")
+                    if isinstance(err, dict):
+                        err_msg = str(err.get("message", err_msg))
+                    elif err:
+                        err_msg = str(err)
                     elif data.get("message"):
-                        error_message = str(data["message"])
-
-                raise RuntimeError(error_message)
+                        err_msg = str(data["message"])
+                raise RuntimeError(err_msg)
 
             if not isinstance(data, dict):
                 raise RuntimeError("API вернул некорректный JSON.")
 
             choices = data.get("choices")
             if not isinstance(choices, list) or not choices:
-                raise RuntimeError(
-                    f"В ответе API отсутствует choices: {str(data)[:500]}"
-                )
+                raise RuntimeError("Ответ API не содержит choices.")
 
-            first_choice = choices[0]
-            if not isinstance(first_choice, dict):
-                raise RuntimeError("Некорректный формат choices.")
-
-            message_data = first_choice.get("message")
+            message_data = choices[0].get("message")
             if not isinstance(message_data, dict):
-                raise RuntimeError("В ответе API отсутствует message.")
+                raise RuntimeError("Ответ API не содержит message.")
 
             choice = message_data.get("content")
             if choice is None:
-                raise RuntimeError("API вернул пустой content.")
+                raise RuntimeError("Модель прислала пустой content.")
 
-            choice = str(choice).strip()
-            if not choice:
-                raise RuntimeError("Модель вернула пустой ответ.")
-
-            return choice
-
+            clean_choice = str(choice).strip()
+            if not clean_choice:
+                raise RuntimeError("Модель вернула пустую строку.")
+            return clean_choice
     except aiohttp.ClientError as e:
-        raise RuntimeError(f"Ошибка соединения с API: {e}") from e
+        raise RuntimeError(f"Сетевая ошибка: {e}") from e
 
 
 # ============================================================
-# ОСНОВНОЙ CHATBOT
+# ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ
 # ============================================================
 
 @Client.on_message(_TRIGGER)
 async def chatbot(client: Client, message: Message):
-    # ВАЖНО: этот хендлер ловит ВСЕ входящие текстовые сообщения.
-    # Без ContinuePropagation он глушит остальные модули в группе 0
-    # (filters, antipm, mafia и т.д.), поэтому отдаём управление дальше
-    # на КАЖДОМ выходе из функции.
-    key = get_ai_key()
-    if not key:
-        raise ContinuePropagation
+    # FIX #5: is_chatbot_enabled() проверяется здесь единожды
+    if not is_chatbot_enabled():
+        return
+    if not is_chat_enabled(message.chat.id):
+        return
+    if not get_ai_key():
+        return
 
     if message.from_user and message.from_user.is_bot:
-        raise ContinuePropagation
+        return
 
-    text = message.text or ""
+    text = message.text or message.caption or ""
     if not text.strip():
-        raise ContinuePropagation
+        return
 
-    if re.search(r"t\.me/TrueMafiaBlackBot", text, re.IGNORECASE):
-        raise ContinuePropagation
+    # FIX #3: игнорируем команды юзербота
+    if _looks_like_command(text):
+        return
 
-    username_pattern = rf"@{re.escape(_OWNER_USERNAME)}\b"
+    # FIX #6: настраиваемые игнор-паттерны
+    for pattern in get_ignore_patterns():
+        try:
+            if re.search(pattern, text, re.IGNORECASE):
+                return
+        except re.error:
+            continue
 
-    # Ответ в группах только по тегу или реплаю
+    _, self_username, _ = _get_owner_details(client)
+
+    # FIX #2: если username нет — в группах вообще игнорируем упоминания
     if message.chat.type not in (enums.ChatType.PRIVATE,):
         is_reply_to_me = bool(
             message.reply_to_message
             and message.reply_to_message.from_user
             and message.reply_to_message.from_user.is_self
         )
-
-        is_mentioned = bool(re.search(username_pattern, text, re.IGNORECASE))
+        is_mentioned = False
+        if self_username:
+            username_pattern = rf"@{re.escape(self_username)}\b"
+            is_mentioned = bool(re.search(username_pattern, text, re.IGNORECASE))
 
         if not (is_reply_to_me or is_mentioned):
-            raise ContinuePropagation
+            return
 
-    prompt = re.sub(username_pattern, "", text, flags=re.IGNORECASE).strip()
+    # Убираем упоминание из промпта (только если username есть)
+    if self_username:
+        username_pattern = rf"@{re.escape(self_username)}\b"
+        prompt = re.sub(username_pattern, "", text, flags=re.IGNORECASE).strip()
+    else:
+        prompt = text.strip()
+
     if not prompt:
         prompt = text.strip()
 
-    if message.reply_to_message and message.reply_to_message.text:
-        reply_text = message.reply_to_message.text.strip()
-        prompt = (
-            f"Контекст сообщения:\n"
-            f"{reply_text}\n\n"
-            f"Ответ пользователя:\n"
-            f"{prompt}"
-        )
+    if message.reply_to_message:
+        reply_context = message.reply_to_message.text or message.reply_to_message.caption or ""
+        if reply_context.strip():
+            prompt = (
+                f"Контекст предыдущего сообщения:\n"
+                f"{reply_context.strip()}\n\n"
+                f"Ответ/вопрос пользователя:\n"
+                f"{prompt}"
+            )
 
     if len(prompt) > 4000:
         prompt = prompt[:4000]
 
-    system = _build_system_prompt()
+    system = _build_system_prompt(client)
     start_time = time.perf_counter()
 
     try:
-        await message.reply_chat_action(enums.ChatAction.TYPING)
-        answer = await _chat(prompt, system)
+        try:
+            await message.reply_chat_action(enums.ChatAction.TYPING)
+        except Exception:
+            pass
 
+        answer = await _chat(prompt, system)
         elapsed = round(time.perf_counter() - start_time, 2)
 
-        # Удаляем ссылки
-        answer = re.sub(r"https?://\S+", "ссылка удалена", answer)
+        # FIX #8: вырезаем ссылки только если включён strip_links
+        if get_strip_links():
+            answer = re.sub(r"(https?://\S+|t\.me/\S+)", "[ссылка скрыта]", answer)
 
         if len(answer) > 4090:
             answer = answer[:4090] + "…"
 
-        await message.reply_text(
-            answer,
-            parse_mode=enums.ParseMode.DISABLED,
-        )
+        await message.reply_text(answer, parse_mode=None)
 
-        # Формирование детального лога
+        # Логирование
         user_name = message.from_user.first_name if message.from_user else "Unknown"
-        user_tag = f"@{message.from_user.username}" if (message.from_user and message.from_user.username) else "нет юзернейма"
+        user_tag = f"@{message.from_user.username}" if (message.from_user and message.from_user.username) else "нет"
         user_id = message.from_user.id if message.from_user else 0
 
-        chat_title = message.chat.title or "Личные сообщения"
+        # FIX #3 (соседний): корректное имя чата для ЛС
+        if message.chat.type == enums.ChatType.PRIVATE:
+            chat_title = message.chat.first_name or "Личные сообщения"
+        else:
+            chat_title = message.chat.title or "Группа"
+
         chat_id = message.chat.id
         current_model = get_current_model()
         preset_info = "chechen" if _che_enabled() else get_current_preset()
@@ -699,16 +849,12 @@ async def chatbot(client: Client, message: Message):
             f"⏱ <b>Время ответа:</b> <code>{elapsed}s</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"❓ <b>Запрос:</b>\n"
-            f"<blockquote>{html.escape(prompt[:500])}</blockquote>\n\n"
+            f"<blockquote>{html.escape(prompt[:400])}</blockquote>\n\n"
             f"💡 <b>Ответ ИИ:</b>\n"
-            f"<blockquote>{html.escape(answer[:500])}</blockquote>"
+            f"<blockquote>{html.escape(answer[:400])}</blockquote>"
         )
-
         await _send_log(client, log_msg)
-        raise ContinuePropagation
 
-    except ContinuePropagation:
-        raise
     except Exception as e:
         log.exception("AI request failed")
         error_msg = (
@@ -720,11 +866,78 @@ async def chatbot(client: Client, message: Message):
             f"<code>{html.escape(str(e))}</code>"
         )
         await _send_log(client, error_msg)
-        raise ContinuePropagation
 
 
 # ============================================================
-# .AILOG (УПРАВЛЕНИЕ И ТЕСТ ЛОГОВ)
+# .AITOGGLE
+# ============================================================
+
+@Client.on_message(filters.command("aitoggle", prefix) & filters.me)
+async def aitoggle_cmd(_, message: Message):
+    args = message.text.split(maxsplit=1)
+
+    if len(args) < 2:
+        new_state = not is_chatbot_enabled()
+        set_chatbot_enabled(new_state)
+        status_emoji = "✅" if new_state else "🔴"
+        status_text = "включен" if new_state else "выключен"
+        await message.reply_text(
+            f"{status_emoji} <b>Чатбот глобально {status_text}</b>\n\n"
+            "<b>Параметры:</b>\n"
+            "• <code>.aitoggle on / off</code>\n"
+            "• <code>.aitoggle here</code> — вкл/выкл в этом чате\n"
+            "• <code>.aitoggle status</code>"
+        )
+        return
+
+    param = args[1].strip().lower()
+
+    if param in ("on", "1", "yes", "true", "enable"):
+        set_chatbot_enabled(True)
+        await message.reply_text("✅ <b>Чатбот глобально включен.</b>")
+        return
+    if param in ("off", "0", "no", "false", "disable"):
+        set_chatbot_enabled(False)
+        await message.reply_text("🔴 <b>Чатбот глобально выключен.</b>")
+        return
+    if param in ("here", "chat", "toggle"):
+        chat_id = message.chat.id
+        new_state = toggle_chat_enabled(chat_id)
+        chat_title = message.chat.title or "Личные сообщения"
+        status_emoji = "✅" if new_state else "🔴"
+        status_text = "включен" if new_state else "выключен"
+        await message.reply_text(
+            f"{status_emoji} <b>Чатбот {status_text} для чата:</b>\n"
+            f"<code>{html.escape(chat_title)}</code> (<code>{chat_id}</code>)"
+        )
+        return
+    if param in ("status", "info", "state"):
+        global_enabled = is_chatbot_enabled()
+        disabled_chats = get_disabled_chats()
+        current_chat_enabled = is_chat_enabled(message.chat.id) and global_enabled
+        global_emoji = "✅" if global_enabled else "🔴"
+        chat_emoji = "✅" if current_chat_enabled else "🔴"
+        text = (
+            f"<b>📊 Статус AI Chatbot</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"{global_emoji} <b>Глобально:</b> {'включен' if global_enabled else 'выключен'}\n"
+            f"{chat_emoji} <b>В этом чате:</b> {'работает' if current_chat_enabled else 'выключен'}\n"
+            f"🚫 <b>Отключено чатов:</b> <code>{len(disabled_chats)}</code>\n\n"
+        )
+        if disabled_chats:
+            text += "<b>Отключенные ID:</b>\n"
+            for c_id in disabled_chats[:6]:
+                text += f"• <code>{c_id}</code>\n"
+            if len(disabled_chats) > 6:
+                text += f"<i>...и еще {len(disabled_chats) - 6}</i>\n"
+        await message.reply_text(text)
+        return
+
+    await message.reply_text("❌ Используйте: <code>.aitoggle [on|off|here|status]</code>")
+
+
+# ============================================================
+# .AILOG
 # ============================================================
 
 @Client.on_message(filters.command("ailog", prefix) & filters.me)
@@ -735,13 +948,13 @@ async def ailog_cmd(client: Client, message: Message):
     if len(args) < 2:
         status = f"<code>{html.escape(str(current))}</code>" if current else "<b>выключены</b>"
         await message.reply_text(
-            f"📋 <b>Чат для логов:</b> {status}\n\n"
+            f"📋 <b>Текущий чат логов:</b> {status}\n\n"
             "<b>Команды:</b>\n"
-            "• <code>.ailog here</code> — отправлять в текущий чат\n"
-            "• <code>.ailog me</code> — отправлять в Избранное\n"
-            "• <code>.ailog &lt;chat_id / @channel&gt;</code> — задать чат/канал\n"
-            "• <code>.ailog test</code> — проверить отправку лога\n"
-            "• <code>.ailog off</code> — отключить логи"
+            "• <code>.ailog here</code>\n"
+            "• <code>.ailog me</code>\n"
+            "• <code>.ailog &lt;chat_id / @channel&gt;</code>\n"
+            "• <code>.ailog test</code>\n"
+            "• <code>.ailog off</code>"
         )
         return
 
@@ -749,61 +962,40 @@ async def ailog_cmd(client: Client, message: Message):
 
     if param.lower() == "off":
         set_log_chat(None)
-        await message.reply_text("<b>✅ Отправка логов отключена.</b>")
+        await message.reply_text("✅ <b>Логирование выключено.</b>")
         return
 
     if param.lower() == "test":
         if not current:
-            await message.reply_text("❌ <b>Логи не настроены!</b> Сначала укажите чат (например: <code>.ailog me</code>)")
+            await message.reply_text("❌ Логи не настроены!")
             return
-
         try:
             await client.send_message(
                 chat_id=current,
-                text=(
-                    "🔔 <b>Тестовое сообщение логера AI Chatbot</b>\n"
-                    "Логирование успешно подключено и функционирует!"
-                ),
+                text="🔔 <b>Тест логирования AI Chatbot</b>\nЛогирование успешно подключено!",
                 parse_mode=enums.ParseMode.HTML,
             )
-            await message.reply_text(f"✅ <b>Тестовый лог успешно отправлен в:</b> <code>{html.escape(str(current))}</code>")
+            await message.reply_text(f"✅ Тест успешно отправлен в: <code>{html.escape(str(current))}</code>")
         except Exception as e:
-            await message.reply_text(
-                f"❌ <b>Не удалось отправить лог:</b>\n"
-                f"<code>{html.escape(str(e))}</code>\n\n"
-                "<i>Убедитесь, что бот состоит в этом чате или канал/группа доступны.</i>"
-            )
+            await message.reply_text(f"❌ <b>Ошибка:</b>\n<code>{html.escape(str(e))}</code>")
         return
 
     if param.lower() == "here":
         set_log_chat(message.chat.id)
-        await message.reply_text(
-            f"<b>✅ Логи будут отправляться сюда:</b> <code>{message.chat.id}</code>\n"
-            "Проверьте работу командой: <code>.ailog test</code>"
-        )
+        await message.reply_text(f"✅ Логи → текущий чат: <code>{message.chat.id}</code>")
         return
-
     if param.lower() == "me":
         set_log_chat("me")
-        await message.reply_text(
-            "<b>✅ Логи будут отправляться в Избранное.</b>\n"
-            "Проверьте работу командой: <code>.ailog test</code>"
-        )
+        await message.reply_text("✅ Логи → в <b>Избранное</b>.")
         return
 
     try:
         chat_id = int(param)
         set_log_chat(chat_id)
-        await message.reply_text(
-            f"<b>✅ Логи установлены на ID:</b> <code>{chat_id}</code>\n"
-            "Проверьте работу командой: <code>.ailog test</code>"
-        )
+        await message.reply_text(f"✅ Логи → ID: <code>{chat_id}</code>")
     except ValueError:
         set_log_chat(param)
-        await message.reply_text(
-            f"<b>✅ Логи установлены на:</b> <code>{html.escape(param)}</code>\n"
-            "Проверьте работу командой: <code>.ailog test</code>"
-        )
+        await message.reply_text(f"✅ Логи → <code>{html.escape(param)}</code>")
 
 
 # ============================================================
@@ -816,20 +1008,14 @@ async def aipreset_cmd(_, message: Message):
     current = get_current_preset()
 
     if len(args) < 2:
-        text = (
-            "<b>🎭 Управление характером:</b>\n\n"
+        await message.reply_text(
+            "<b>🎭 Управление характером ИИ:</b>\n\n"
             f"• <b>Текущий режим:</b> <code>{html.escape(current)}</code>\n\n"
-            "<b>Доступные пресеты:</b>\n"
-            "• <code>toxic</code> — дерзкий и колкий\n"
-            "• <code>default</code> — стандартный\n"
-            "• <code>friendly</code> — дружелюбный\n"
-            "• <code>bro</code> — пацанский стиль\n"
-            "• <code>custom</code> — собственный промпт\n\n"
-            "<b>Использование:</b>\n"
+            "<b>Пресеты:</b> <code>toxic</code>, <code>default</code>, "
+            "<code>friendly</code>, <code>bro</code>, <code>custom</code>\n\n"
             "<code>.aipreset toxic</code>\n"
-            "<code>.aipreset custom &lt;промпт&gt;</code>"
+            "<code>.aipreset custom Ты полезный ассистент...</code>"
         )
-        await message.reply_text(text)
         return
 
     choice = args[1].strip()
@@ -839,27 +1025,21 @@ async def aipreset_cmd(_, message: Message):
         if len(parts) > 1:
             set_custom_prompt(parts[1].strip())
             set_preset("custom")
-            await message.reply_text("<b>✅ Кастомный характер сохранён и активирован!</b>")
+            await message.reply_text("✅ <b>Кастомный промпт сохранён!</b>")
         else:
             current_custom = get_custom_prompt() or "не задан"
             await message.reply_text(
-                f"<b>Кастомный промпт:</b>\n<code>{html.escape(current_custom)}</code>\n\n"
-                "Изменить:\n<code>.aipreset custom Ты злой робот...</code>"
+                f"<b>Текущий кастомный промпт:</b>\n<code>{html.escape(current_custom)}</code>"
             )
         return
 
     choice_clean = choice.lower()
     if choice_clean in _PRESETS:
         set_preset(choice_clean)
-        await message.reply_text(
-            f"<b>✅ Характер изменён на:</b> <code>{html.escape(choice_clean)}</code>"
-        )
+        await message.reply_text(f"✅ <b>Характер:</b> <code>{html.escape(choice_clean)}</code>")
         return
 
-    await message.reply_text(
-        f"❌ Неизвестный пресет: <code>{html.escape(choice)}</code>\n"
-        "Доступны: <code>toxic</code>, <code>default</code>, <code>friendly</code>, <code>bro</code>, <code>custom</code>"
-    )
+    await message.reply_text(f"❌ Неизвестный пресет: <code>{html.escape(choice)}</code>")
 
 
 # ============================================================
@@ -869,30 +1049,16 @@ async def aipreset_cmd(_, message: Message):
 @Client.on_message(filters.command("aikey", prefix) & filters.me)
 async def aikey_cmd(_, message: Message):
     args = message.text.split(maxsplit=1)
-
     if len(args) < 2:
         current = get_ai_key()
         if current:
-            masked = current[:7] + "..." + current[-4:] if len(current) > 11 else "***"
-            await message.reply_text(
-                f"🔑 <b>Текущий AI_KEY:</b> <code>{html.escape(masked)}</code>\n\n"
-                "Изменить:\n<code>.aikey sk-or-v1-...</code>"
-            )
+            masked = current[:6] + "..." + current[-4:] if len(current) > 10 else "***"
+            await message.reply_text(f"🔑 <b>AI_KEY:</b> <code>{html.escape(masked)}</code>")
         else:
-            await message.reply_text(
-                "❌ <b>AI_KEY не задан!</b>\nИспользуйте:\n<code>.aikey sk-or-v1-...</code>"
-            )
+            await message.reply_text("❌ <b>AI_KEY не задан!</b>")
         return
-
-    new_key = args[1].strip()
-    if not new_key:
-        await message.reply_text("❌ Ключ пустой.")
-        return
-
-    set_ai_key(new_key)
-    await message.reply_text(
-        "<b>✅ AI_KEY успешно сохранён.</b>\nПроверьте через <code>.aistatus</code>"
-    )
+    set_ai_key(args[1].strip())
+    await message.reply_text("✅ <b>AI_KEY сохранён!</b>")
 
 
 # ============================================================
@@ -902,158 +1068,244 @@ async def aikey_cmd(_, message: Message):
 @Client.on_message(filters.command("aibase", prefix) & filters.me)
 async def aibase_cmd(_, message: Message):
     args = message.text.split(maxsplit=1)
-
     if len(args) < 2:
-        await message.reply_text(
-            f"🌐 <b>Текущий URL:</b>\n<code>{html.escape(get_ai_base_url())}</code>\n\n"
-            "Изменить:\n<code>.aibase https://...</code>"
-        )
+        await message.reply_text(f"🌐 <b>URL:</b>\n<code>{html.escape(get_ai_base_url())}</code>")
         return
-
     new_url = args[1].strip()
     if not re.match(r"^https?://", new_url, re.IGNORECASE):
-        await message.reply_text(
-            "❌ URL должен начинаться с <code>http://</code> или <code>https://</code>"
-        )
+        await message.reply_text("❌ URL должен начинаться с http:// или https://")
         return
-
     set_ai_base_url(new_url)
-    await message.reply_text(
-        f"<b>✅ URL API изменён на:</b>\n<code>{html.escape(new_url)}</code>"
-    )
+    await message.reply_text(f"✅ <b>URL изменён:</b>\n<code>{html.escape(new_url)}</code>")
 
 
 # ============================================================
-# .AISTATUS
+# .AISTATUS (FIX #10: без принудительного ping-запроса)
 # ============================================================
 
 @Client.on_message(filters.command("aistatus", prefix) & filters.me)
-async def aistatus(_, message: Message):
+async def aistatus_cmd(_, message: Message):
+    args = message.text.split(maxsplit=1)
+    do_test = len(args) > 1 and args[1].strip().lower() == "test"
+
     key = get_ai_key()
     current_model = get_current_model()
     base_url = get_ai_base_url()
     models = get_models()
     preset = get_current_preset()
     log_target = get_log_chat()
+    global_enabled = is_chatbot_enabled()
+    chat_enabled = is_chat_enabled(message.chat.id) and global_enabled
+    disabled_count = len(get_disabled_chats())
 
     lines = [
-        "<b>🤖 AI ChatBot Status</b>",
-        "",
-        "• Модуль загружен: <b>да</b>",
-        "• AI_KEY: " + ("<code>задан</code>" if key else "<b>❌ НЕ ЗАДАН!</b>"),
-        f"• URL API: <code>{html.escape(base_url)}</code>",
-        f"• Текущая модель: <code>{html.escape(current_model)}</code>",
-        f"• Пресет характера: <code>{html.escape(preset)}</code>",
-        f"• Логи в чат: <code>{html.escape(str(log_target or 'выкл'))}</code>",
-        f"• Моделей в списке: <b>{len(models)}</b>",
+        "<b>🤖 Статус AI ChatBot</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"• Глобально: <b>{'✅ включен' if global_enabled else '🔴 выключен'}</b>",
+        f"• В этом чате: <b>{'✅ работает' if chat_enabled else '🔴 выключен'}</b>",
+        f"• Отключено чатов: <code>{disabled_count}</code>",
+        f"• Чеченский режим: <b>{'✅ ВКЛ' if _che_enabled() else 'выкл'}</b>",
+        "• AI_KEY: " + ("<code>задан</code>" if key else "<b>❌ НЕ ЗАДАН</b>"),
+        f"• URL: <code>{html.escape(base_url)}</code>",
+        f"• Модель: <code>{html.escape(current_model)}</code>",
+        f"• Пресет: <code>{html.escape(preset)}</code>",
+        f"• Max tokens: <code>{get_max_tokens()}</code>",
+        f"• Strip links: <code>{get_strip_links()}</code>",
+        f"• Логи: <code>{html.escape(str(log_target or 'выключены'))}</code>",
+        f"• Моделей: <b>{len(models)}</b>",
     ]
 
-    if key:
-        try:
-            answer = await _chat("ping", "Отвечай одним словом: pong")
-            lines.append("")
-            lines.append(f"✅ <b>Тестовый запрос OK:</b> {html.escape(answer[:100])}")
-        except Exception as e:
-            lines.append("")
-            lines.append(f"❌ <b>Тестовый запрос упал:</b>\n<code>{html.escape(str(e))}</code>")
+    if do_test:
+        if not key:
+            lines.append("\n⚠️ Ключ не задан — тест невозможен.")
+        else:
+            try:
+                answer = await _chat("ping", "Отвечай одним словом: pong")
+                lines.append(f"\n✅ <b>Test OK:</b> <code>{html.escape(answer[:60])}</code>")
+            except Exception as e:
+                lines.append(f"\n❌ <b>Test FAIL:</b>\n<code>{html.escape(str(e))}</code>")
     else:
-        lines.append("")
-        lines.append("→ Задайте ключ:\n<code>.aikey sk-or-v1-...</code>")
+        lines.append("\n<i>Для проверки API: <code>.aistatus test</code></i>")
 
     await message.reply_text("\n".join(lines))
 
 
 # ============================================================
-# .AIMODEL
+# .AIMODEL (FIX #1)
 # ============================================================
 
 @Client.on_message(filters.command("aimodel", prefix) & filters.me)
-async def aimodel(_, message: Message):
-    args = message.text.split(maxsplit=1)
+async def aimodel_cmd(_, message: Message):
+    args = message.text.split()
     models = get_models()
     current = get_current_model()
 
-    if len(args) < 2 or args[1].strip().lower() == "list":
-        text = f"<b>📋 Доступные модели ({len(models)} шт.):</b>\n\n"
+    if len(args) < 2 or args[1].lower() == "list":
+        text = f"<b>📋 Модели ({len(models)}):</b>\n\n"
         for i, model in enumerate(models, 1):
-            marker = "✅ " if model == current else "   "
-            text += f"{marker}{i}. <code>{html.escape(model)}</code>\n"
-
-        text += f"\n<i>Текущая модель: {html.escape(current)}</i>"
+            marker = "✅ " if model == current else "▫️ "
+            text += f"{marker}<b>{i}.</b> <code>{html.escape(model)}</code>\n"
+        text += f"\n<i>Текущая: <code>{html.escape(current)}</code></i>\n\n"
         text += (
-            "\n\n<b>Команды:</b>"
-            "\n<code>.aimodel &lt;номер или имя&gt;</code>"
-            "\n<code>.aimodel add &lt;модель&gt;</code>"
-            "\n<code>.aimodel del &lt;номер&gt;</code>"
+            "<b>Команды:</b>\n"
+            "• <code>.aimodel &lt;номер|имя&gt;</code>\n"
+            "• <code>.aimodel add &lt;id&gt;</code>\n"
+            "• <code>.aimodel del &lt;номер&gt;</code>"
         )
         await message.reply_text(text)
         return
 
-    arg = args[1].strip()
+    sub = args[1].lower()
 
-    if arg.lower().startswith("add "):
-        new_model = arg[4:].strip()
-        if not new_model:
-            await message.reply_text("❌ Укажите название модели.")
-            return
-
-        if new_model not in models:
-            models.append(new_model)
-            save_models(models)
+    # FIX #1: строгая проверка подкоманд с обязательным аргументом
+    if sub == "add":
+        if len(args) < 3:
             await message.reply_text(
-                f"<b>✅ Модель добавлена:</b> <code>{html.escape(new_model)}</code>"
+                "❌ Укажите идентификатор модели:\n<code>.aimodel add openai/gpt-4o</code>"
             )
-        else:
-            await message.reply_text("<b>ℹ️ Такая модель уже есть.</b>")
+            return
+        new_model = message.text.split(maxsplit=2)[2].strip()
+        if not new_model:
+            await message.reply_text("❌ Пустое имя модели.")
+            return
+        if new_model in models:
+            await message.reply_text("ℹ️ Эта модель уже есть.")
+            return
+        models.append(new_model)
+        save_models(models)
+        await message.reply_text(f"✅ <b>Добавлена:</b> <code>{html.escape(new_model)}</code>")
         return
 
-    if arg.lower().startswith("del "):
+    if sub == "del":
+        if len(args) < 3:
+            await message.reply_text("❌ Укажите номер модели: <code>.aimodel del 2</code>")
+            return
         try:
-            idx = int(arg[4:].strip()) - 1
+            idx = int(args[2]) - 1
         except ValueError:
-            await message.reply_text("❌ Использование: <code>.aimodel del 2</code>")
+            await message.reply_text("❌ Номер должен быть числом.")
             return
-
         if not (0 <= idx < len(models)):
-            await message.reply_text("❌ Модель с таким номером не найдена.")
+            await message.reply_text("❌ Неверный номер.")
             return
-
         if len(models) <= 1:
-            await message.reply_text("❌ Нельзя удалить последнюю модель.")
+            await message.reply_text("❌ Нельзя удалить единственную модель.")
             return
-
         removed = models.pop(idx)
         if removed == current:
-            new_current = models[0]
-            db.set("custom.chatbot", "current_model", new_current)
-
+            db.set("custom.chatbot", "current_model", models[0])
         save_models(models)
-        await message.reply_text(
-            f"<b>✅ Модель удалена:</b> <code>{html.escape(removed)}</code>"
-        )
+        await message.reply_text(f"✅ <b>Удалена:</b> <code>{html.escape(removed)}</code>")
         return
 
+    # Выбор по номеру
+    arg = args[1]
     try:
         idx = int(arg) - 1
         if 0 <= idx < len(models):
             selected = models[idx]
             set_current_model(selected)
-            await message.reply_text(
-                f"<b>✅ Модель изменена на:</b> <code>{html.escape(selected)}</code>"
-            )
+            await message.reply_text(f"✅ <b>Выбрана:</b> <code>{html.escape(selected)}</code>")
             return
-
-        await message.reply_text(
-            f"<b>❌ Неверный номер.</b> Доступно: <b>{len(models)}</b>"
-        )
+        await message.reply_text(f"❌ Неверный номер (всего: {len(models)})")
         return
     except ValueError:
         pass
 
+    # Выбор по имени
     if set_current_model(arg):
+        await message.reply_text(f"✅ <b>Установлена:</b> <code>{html.escape(arg)}</code>")
+
+
+# ============================================================
+# .AITOKENS / .AILINKS / .AIIGNORE (FIX #6, #8, #9)
+# ============================================================
+
+@Client.on_message(filters.command("aitokens", prefix) & filters.me)
+async def aitokens_cmd(_, message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
         await message.reply_text(
-            f"<b>✅ Модель установлена:</b> <code>{html.escape(arg)}</code>"
+            f"📊 <b>Max tokens:</b> <code>{get_max_tokens()}</code>\n\n"
+            "Изменить: <code>.aitokens 4096</code>"
         )
+        return
+    try:
+        val = int(args[1].strip())
+    except ValueError:
+        await message.reply_text("❌ Введите число.")
+        return
+    set_max_tokens(val)
+    await message.reply_text(f"✅ <b>Max tokens:</b> <code>{get_max_tokens()}</code>")
+
+
+@Client.on_message(filters.command("ailinks", prefix) & filters.me)
+async def ailinks_cmd(_, message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        state = "✅ вырезаются" if get_strip_links() else "🔴 сохраняются"
+        await message.reply_text(
+            f"🔗 <b>Ссылки в ответах:</b> {state}\n\n"
+            "<code>.ailinks on / off</code>"
+        )
+        return
+    val = args[1].strip().lower()
+    if val in ("on", "1", "yes"):
+        set_strip_links(True)
+        await message.reply_text("✅ Ссылки будут вырезаться.")
+    elif val in ("off", "0", "no"):
+        set_strip_links(False)
+        await message.reply_text("🔴 Ссылки сохраняются.")
+    else:
+        await message.reply_text("❌ Используйте <code>on</code> или <code>off</code>.")
+
+
+@Client.on_message(filters.command("aiignore", prefix) & filters.me)
+async def aiignore_cmd(_, message: Message):
+    args = message.text.split(maxsplit=2)
+    patterns = get_ignore_patterns()
+
+    if len(args) < 2 or args[1].lower() == "list":
+        text = f"<b>🚫 Игнор-паттерны ({len(patterns)}):</b>\n\n"
+        for i, p in enumerate(patterns, 1):
+            text += f"<b>{i}.</b> <code>{html.escape(p)}</code>\n"
+        text += (
+            "\n<b>Команды:</b>\n"
+            "• <code>.aiignore add &lt;regex&gt;</code>\n"
+            "• <code>.aiignore del &lt;regex&gt;</code>"
+        )
+        await message.reply_text(text)
+        return
+
+    sub = args[1].lower()
+    if sub == "add":
+        if len(args) < 3:
+            await message.reply_text("❌ Укажите regex: <code>.aiignore add t\\.me/spambot</code>")
+            return
+        pattern = args[2].strip()
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            await message.reply_text(f"❌ Неверный regex: <code>{html.escape(str(e))}</code>")
+            return
+        if add_ignore_pattern(pattern):
+            await message.reply_text(f"✅ Добавлен: <code>{html.escape(pattern)}</code>")
+        else:
+            await message.reply_text("ℹ️ Уже есть.")
+        return
+
+    if sub == "del":
+        if len(args) < 3:
+            await message.reply_text("❌ Укажите паттерн для удаления.")
+            return
+        pattern = args[2].strip()
+        if del_ignore_pattern(pattern):
+            await message.reply_text(f"✅ Удалён: <code>{html.escape(pattern)}</code>")
+        else:
+            await message.reply_text("ℹ️ Не найден.")
+        return
+
+    await message.reply_text("❌ Используйте: <code>list / add / del</code>")
 
 
 # ============================================================
@@ -1070,88 +1322,75 @@ async def che_cmd(_, message: Message):
         set_che_enabled(new_state)
         state = "включён" if new_state else "выключен"
         await message.reply_text(
-            f"<b>🌐 Чеченский язык: {state}</b>\n"
-            f"Дальше бот отвечает {'на чеченском' if new_state else 'как обычно'}.\n\n"
-            "Управление словарём:\n"
-            "<code>.che add слово=перевод</code>\n"
-            "<code>.che del слово</code>\n"
-            "<code>.che list</code>\n"
-            "<code>.che load</code>"
+            f"🌐 <b>Чеченский режим: {state}</b>\n\n"
+            "<b>Словарь:</b>\n"
+            "• <code>.che add слово=перевод</code>\n"
+            "• <code>.che del слово</code>\n"
+            "• <code>.che list</code>\n"
+            "• <code>.che load</code> (ответ на PDF)"
         )
         return
 
     if sub in ("on", "1", "yes", "true"):
         set_che_enabled(True)
-        await message.reply_text("<b>🌐 Чеченский язык: включён</b>")
+        await message.reply_text("🌐 Включён.")
         return
-
     if sub in ("off", "0", "no", "false"):
         set_che_enabled(False)
-        await message.reply_text("<b>🌐 Чеченский язык: выключен</b>")
+        await message.reply_text("🌐 Выключен.")
         return
 
     if sub == "list":
         glossary = _get_glossary()
         if not glossary:
-            await message.reply_text("<b>Словарь пуст.</b>")
+            await message.reply_text("📖 <b>Словарь пуст.</b>")
             return
-
-        text = f"<b>📖 Чеченский словарь ({len(glossary)} записей):</b>\n\n"
-        text += "\n".join(f"• {html.escape(x)}" for x in glossary)
+        text = f"<b>📖 Словарь ({len(glossary)}):</b>\n\n"
+        text += "\n".join(f"• {html.escape(x)}" for x in glossary[:60])
+        if len(glossary) > 60:
+            text += f"\n\n<i>...ещё {len(glossary) - 60}</i>"
         await message.reply_text(text)
         return
 
     if sub == "add":
         rest = message.text.split(maxsplit=2)
         if len(rest) < 3:
-            await message.reply_text(
-                "<b>Использование:</b>\n<code>.che add слово=перевод</code>"
-            )
+            await message.reply_text("Использование: <code>.che add слово=перевод</code>")
             return
-
         entry = rest[2].strip()
         ok = add_glossary_word(entry)
-        status = "добавлено" if ok else "уже есть/неверный формат"
-        await message.reply_text(
-            f"<b>📖 Слово {status}:</b> <code>{html.escape(entry)}</code>"
-        )
+        status = "добавлено" if ok else "уже есть / неверный формат"
+        await message.reply_text(f"📖 <b>Слово {status}:</b> <code>{html.escape(entry)}</code>")
         return
 
     if sub == "load":
         reply = message.reply_to_message
         if not (reply and reply.document):
-            await message.reply_text(
-                "<b>Использование:</b>\nОтправьте PDF и ответьте на него:\n<code>.che load</code>"
-            )
+            await message.reply_text("Ответьте <code>.che load</code> на PDF.")
             return
-
         document = reply.document
         file_name = document.file_name or ""
         if not file_name.lower().endswith(".pdf"):
-            await message.reply_text("<b>❌ Это не PDF.</b>")
+            await message.reply_text("❌ Только PDF.")
             return
 
-        await message.reply_text("⏳ Читаю PDF-словарь...")
+        await message.reply_text("⏳ Обработка PDF...")
         path = None
         try:
             path = await reply.download()
             if not path:
-                raise RuntimeError("Не удалось скачать PDF.")
-
-            added, error = load_glossary_from_pdf(path)
+                raise RuntimeError("Не удалось скачать документ.")
+            added, error = await asyncio.to_thread(load_glossary_from_pdf, path)
             if error:
-                await message.reply_text(f"<b>❌ {html.escape(error)}</b>")
+                await message.reply_text(f"❌ {error}")
                 return
-
             await message.reply_text(
-                f"<b>📖 Словарь загружен!</b>\n"
-                f"Добавлено новых слов: <b>{added}</b>\n"
-                f"Всего записей: <b>{len(_get_glossary())}</b>"
+                f"✅ <b>Обновлено!</b>\n"
+                f"• Добавлено: <b>{added}</b>\n"
+                f"• Всего: <b>{len(_get_glossary())}</b>"
             )
         except Exception as e:
-            await message.reply_text(
-                f"<b>❌ Ошибка обработки:</b>\n<code>{html.escape(str(e))}</code>"
-            )
+            await message.reply_text(f"❌ <code>{html.escape(str(e))}</code>")
         finally:
             if path and isinstance(path, str) and os.path.exists(path):
                 try:
@@ -1163,41 +1402,38 @@ async def che_cmd(_, message: Message):
     if sub == "del":
         rest = message.text.split(maxsplit=2)
         if len(rest) < 3:
-            await message.reply_text(
-                "<b>Использование:</b>\n<code>.che del слово</code>"
-            )
+            await message.reply_text("Использование: <code>.che del слово</code>")
             return
-
         word = rest[2].strip()
         ok = del_glossary_word(word)
         status = "удалено" if ok else "не найдено"
-        await message.reply_text(
-            f"<b>📖 Слово {status}:</b> <code>{html.escape(word)}</code>"
-        )
+        await message.reply_text(f"📖 <b>Слово {status}:</b> <code>{html.escape(word)}</code>")
         return
 
     await message.reply_text(
-        "<b>Неизвестная команда.</b>\n\n"
-        "<code>.che</code> — вкл/выкл\n"
-        "<code>.che on</code> — включить\n"
-        "<code>.che off</code> — выключить\n"
-        "<code>.che list</code> — словарь\n"
-        "<code>.che add слово=перевод</code>\n"
-        "<code>.che del слово</code>\n"
-        "<code>.che load</code> — загрузить PDF"
+        "<b>Команды:</b>\n"
+        "• <code>.che on / off</code>\n"
+        "• <code>.che list</code>\n"
+        "• <code>.che add слово=перевод</code>\n"
+        "• <code>.che del слово</code>\n"
+        "• <code>.che load</code>"
     )
 
 
 # ============================================================
-# ПОМОЩЬ
+# СПРАВКА
 # ============================================================
 
 modules_help["chatbot"] = {
     "aikey": "Задать API ключ: .aikey <ключ>",
-    "aibase": "Задать URL API: .aibase <url>",
-    "aistatus": "Показать статус ИИ, модель, пресет и логи",
-    "aimodel": "Управление моделями: list, add, del, выбор",
-    "aipreset": "Смена характера: toxic, friendly, bro, default, custom",
-    "ailog": "Логирование: .ailog here / me / <chat_id> / test / off",
-    "che": "Чеченский: .che on/off, .che list, .che add, .che del, .che load",
+    "aibase": "URL API: .aibase <url>",
+    "aistatus": "Статус (+ .aistatus test для проверки API)",
+    "aimodel": "Модели: list, add, del, выбор",
+    "aipreset": "Характер: toxic/friendly/bro/default/custom",
+    "aitokens": "Лимит токенов: .aitokens 4096",
+    "ailinks": "Вырезать ссылки: .ailinks on/off",
+    "aiignore": "Игнор-паттерны: list/add/del",
+    "ailog": "Логи: .ailog here/me/<id>/test/off",
+    "aitoggle": "Вкл/выкл бот: [on|off|here|status]",
+    "che": "Чеченский: on/off/list/add/del/load",
 }
