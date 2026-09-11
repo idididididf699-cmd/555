@@ -39,13 +39,14 @@ _DEFAULT_MODELS = [
     "openai/gpt-4o-mini",
 ]
 
-# FIX #2, #13: Фоллбэк-имя больше НЕ используется в regex для упоминаний.
-# Если username бота отсутствует — упоминания в группах просто игнорируем.
 _FALLBACK_OWNER_USERNAME = "ai_borz"
-_DEFAULT_IGNORE_PATTERNS = [r"t\.me/(TrueMafiaBlackBot|mafiabot)"]  # FIX #6
-_DEFAULT_MAX_TOKENS = 2048  # FIX #9
+_DEFAULT_IGNORE_PATTERNS = [r"t\.me/(TrueMafiaBlackBot|mafiabot)"]
+_DEFAULT_MAX_TOKENS = 2048
 
 _session: Optional[aiohttp.ClientSession] = None
+
+# Регулярка для фильтрации ссылок с сохранением текста разметки Markdown
+_LINK_RE = re.compile(r"\[([^\]]+)\]\(https?://\S+\)|https?://\S+|t\.me/\S+", re.IGNORECASE)
 
 
 # ============================================================
@@ -98,10 +99,9 @@ _PRESETS = {
 
 
 # ============================================================
-# ФИЛЬТР ВХОДЯЩИХ СООБЩЕНИЙ (FIX #3)
+# ФИЛЬТР ВХОДЯЩИХ СООБЩЕНИЙ
 # ============================================================
 
-# Список префиксов юзербота: чтобы не отправлять .aikey, .che add и т.д. в модель.
 _PREFIXES = tuple(prefix) if isinstance(prefix, (list, tuple, str)) else (".",)
 
 
@@ -114,7 +114,6 @@ def _looks_like_command(text: str) -> bool:
         return False
     if stripped[0] not in _PREFIXES:
         return False
-    # После префикса должен идти буквенно-цифровой символ (иначе это может быть просто точка/многоточие)
     if len(stripped) < 2 or not (stripped[1].isalnum() or stripped[1] == "_"):
         return False
     return True
@@ -128,14 +127,10 @@ _TRIGGER = (
 
 
 # ============================================================
-# УТИЛИТА: безопасное чтение значения из конфига (FIX #14)
+# УТИЛИТА: БЕЗОПАСНОЕ ЧТЕНИЕ КОНФИГА
 # ============================================================
 
 def _read_cfg(value, default: str = "") -> str:
-    """
-    Безопасно читает значение из объекта конфига.
-    Возвращает пустую строку, если объект не str/int/float и не имеет .value.
-    """
     if value is None:
         return default
     if isinstance(value, (str, int, float)):
@@ -159,7 +154,6 @@ def set_chatbot_enabled(value: bool):
 
 
 def get_disabled_chats() -> list[int]:
-    """FIX #7: Очищаем и СОХРАНЯЕМ чистый список обратно в БД."""
     disabled = db.get("custom.chatbot", "disabled_chats", [])
     if not isinstance(disabled, list):
         db.set("custom.chatbot", "disabled_chats", [])
@@ -174,7 +168,6 @@ def get_disabled_chats() -> list[int]:
             dirty = True
             continue
 
-    # Записываем очищенный список только если он реально изменился
     if dirty or len(clean_list) != len(disabled):
         db.set("custom.chatbot", "disabled_chats", clean_list)
 
@@ -196,7 +189,6 @@ def toggle_chat_enabled(chat_id: int) -> bool:
 
 
 def is_chat_enabled(chat_id: int) -> bool:
-    """FIX #5: убрано дублирующее обращение к is_chatbot_enabled() снаружи."""
     try:
         return int(chat_id) not in get_disabled_chats()
     except (ValueError, TypeError):
@@ -204,7 +196,7 @@ def is_chat_enabled(chat_id: int) -> bool:
 
 
 # ============================================================
-# КОНФИГУРАЦИЯ API И МОДЕЛЕЙ (FIX #14 применён везде)
+# КОНФИГУРАЦИЯ API И МОДЕЛЕЙ
 # ============================================================
 
 def get_ai_key() -> str:
@@ -281,7 +273,6 @@ def set_current_model(model: str) -> bool:
 
 
 def get_max_tokens() -> int:
-    """FIX #9: настраиваемый лимит токенов."""
     try:
         val = int(db.get("custom.chatbot", "max_tokens", _DEFAULT_MAX_TOKENS))
         return max(64, min(val, 32768))
@@ -294,7 +285,6 @@ def set_max_tokens(value: int):
 
 
 def get_strip_links() -> bool:
-    """FIX #8: настройка вырезания ссылок из ответа."""
     return bool(db.get("custom.chatbot", "strip_links", False))
 
 
@@ -303,7 +293,6 @@ def set_strip_links(value: bool):
 
 
 def get_ignore_patterns() -> list[str]:
-    """FIX #6: список игнор-паттернов."""
     saved = db.get("custom.chatbot", "ignore_patterns", None)
     if not isinstance(saved, list):
         db.set("custom.chatbot", "ignore_patterns", _DEFAULT_IGNORE_PATTERNS.copy())
@@ -435,17 +424,10 @@ def _get_glossary() -> list[str]:
 
 
 def add_glossary_word(entry: str) -> bool:
-    """
-    FIX #4:
-    - Больше НЕ заменяем все = подряд, работаем только с ПЕРВЫМ разделителем.
-    - Убрали ошибочную замену ≠ → → (это была опечатка).
-    - Приоритет разделителей: → > -> > = (первое встреченное).
-    """
     entry = entry.strip()
     if not entry:
         return False
 
-    # Ищем первый попавшийся разделитель
     separators = ["→", "->", "="]
     split_pos = -1
     used_sep = None
@@ -498,11 +480,6 @@ def del_glossary_word(entry: str) -> bool:
 
 
 def _extract_words_from_text(text: str) -> list[str]:
-    """
-    FIX #11, #15:
-    - Работаем с cleaned везде.
-    - Добавлена поддержка формата "слово-перевод" без пробелов.
-    """
     entries = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -526,12 +503,10 @@ def _extract_words_from_text(text: str) -> list[str]:
         elif ": " in cleaned:
             left, right = cleaned.split(": ", 1)
         else:
-            # Пробуем: "word - translation"
             match = re.match(r"^\s*(.+?)\s+-\s+(.+?)\s*$", cleaned)
             if match:
                 left, right = match.group(1), match.group(2)
             else:
-                # FIX #15: fallback для "word-translation" без пробелов
                 match = re.match(r"^([^\W\d_]+)-([^\W\d_].+)$", cleaned, re.UNICODE)
                 if match:
                     left, right = match.group(1), match.group(2)
@@ -577,7 +552,7 @@ def load_glossary_from_pdf(pdf_path: str) -> tuple[int, str]:
 # ============================================================
 
 async def _get_session() -> aiohttp.ClientSession:
-    """Пересоздаём сессию при смене event loop (перезапуск бота)."""
+    """Пересоздаёт сессию при смене event loop (перезапуск бота)."""
     global _session
     try:
         current_loop = asyncio.get_running_loop()
@@ -590,21 +565,23 @@ async def _get_session() -> aiohttp.ClientSession:
         or (current_loop is not None and getattr(_session, "_loop", None) is not current_loop)
     )
     if needs_new:
-        if _session and not _session.closed:
-            try:
-                await _session.close()
-            except Exception:
-                pass
+        await close_session()
         _session = aiohttp.ClientSession()
     return _session
 
 
+async def close_session():
+    """Позволяет избежать утечки ресурсов при остановке или перезапуске бота."""
+    global _session
+    if _session and not _session.closed:
+        try:
+            await _session.close()
+        except Exception:
+            pass
+        _session = None
+
+
 def _get_owner_details(client: Optional[Client] = None) -> tuple[str, Optional[str], int]:
-    """
-    FIX #2, #13:
-    Возвращает (owner_name, username_or_None, owner_id).
-    Если у бота нет username — возвращаем None вместо фоллбэка ai_borz.
-    """
     username: Optional[str] = None
     owner_id = 0
 
@@ -625,7 +602,6 @@ def _get_owner_details(client: Optional[Client] = None) -> tuple[str, Optional[s
 
 def _build_system_prompt(client: Optional[Client] = None) -> str:
     owner_name, username, owner_id = _get_owner_details(client)
-    # Для промпта фоллбэк допустим (это просто текст для модели)
     username_for_prompt = username or _FALLBACK_OWNER_USERNAME
     owner_info = f"{owner_name} (@{username_for_prompt}, ID: {owner_id})"
 
@@ -676,7 +652,7 @@ async def _chat(prompt: str, system: str) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": get_max_tokens(),  # FIX #9
+        "max_tokens": get_max_tokens(),
     }
 
     session = await _get_session()
@@ -736,7 +712,6 @@ async def _chat(prompt: str, system: str) -> str:
 
 @Client.on_message(_TRIGGER)
 async def chatbot(client: Client, message: Message):
-    # FIX #5: is_chatbot_enabled() проверяется здесь единожды
     if not is_chatbot_enabled():
         return
     if not is_chat_enabled(message.chat.id):
@@ -751,11 +726,9 @@ async def chatbot(client: Client, message: Message):
     if not text.strip():
         return
 
-    # FIX #3: игнорируем команды юзербота
     if _looks_like_command(text):
         return
 
-    # FIX #6: настраиваемые игнор-паттерны
     for pattern in get_ignore_patterns():
         try:
             if re.search(pattern, text, re.IGNORECASE):
@@ -765,7 +738,6 @@ async def chatbot(client: Client, message: Message):
 
     _, self_username, _ = _get_owner_details(client)
 
-    # FIX #2: если username нет — в группах вообще игнорируем упоминания
     if message.chat.type not in (enums.ChatType.PRIVATE,):
         is_reply_to_me = bool(
             message.reply_to_message
@@ -780,7 +752,6 @@ async def chatbot(client: Client, message: Message):
         if not (is_reply_to_me or is_mentioned):
             return
 
-    # Убираем упоминание из промпта (только если username есть)
     if self_username:
         username_pattern = rf"@{re.escape(self_username)}\b"
         prompt = re.sub(username_pattern, "", text, flags=re.IGNORECASE).strip()
@@ -815,21 +786,25 @@ async def chatbot(client: Client, message: Message):
         answer = await _chat(prompt, system)
         elapsed = round(time.perf_counter() - start_time, 2)
 
-        # FIX #8: вырезаем ссылки только если включён strip_links
         if get_strip_links():
-            answer = re.sub(r"(https?://\S+|t\.me/\S+)", "[ссылка скрыта]", answer)
+            answer = _LINK_RE.sub(
+                lambda m: f"[{m.group(1)}]([ссылка скрыта])" if m.group(1) else "[ссылка скрыта]",
+                answer
+            )
 
         if len(answer) > 4090:
             answer = answer[:4090] + "…"
 
-        await message.reply_text(answer, parse_mode=None)
+        try:
+            await message.reply_text(answer, parse_mode=enums.ParseMode.MARKDOWN)
+        except Exception:
+            await message.reply_text(answer, parse_mode=None)
 
         # Логирование
         user_name = message.from_user.first_name if message.from_user else "Unknown"
         user_tag = f"@{message.from_user.username}" if (message.from_user and message.from_user.username) else "нет"
         user_id = message.from_user.id if message.from_user else 0
 
-        # FIX #3 (соседний): корректное имя чата для ЛС
         if message.chat.type == enums.ChatType.PRIVATE:
             chat_title = message.chat.first_name or "Личные сообщения"
         else:
@@ -1080,7 +1055,7 @@ async def aibase_cmd(_, message: Message):
 
 
 # ============================================================
-# .AISTATUS (FIX #10: без принудительного ping-запроса)
+# .AISTATUS
 # ============================================================
 
 @Client.on_message(filters.command("aistatus", prefix) & filters.me)
@@ -1131,7 +1106,7 @@ async def aistatus_cmd(_, message: Message):
 
 
 # ============================================================
-# .AIMODEL (FIX #1)
+# .AIMODEL
 # ============================================================
 
 @Client.on_message(filters.command("aimodel", prefix) & filters.me)
@@ -1157,7 +1132,6 @@ async def aimodel_cmd(_, message: Message):
 
     sub = args[1].lower()
 
-    # FIX #1: строгая проверка подкоманд с обязательным аргументом
     if sub == "add":
         if len(args) < 3:
             await message.reply_text(
@@ -1198,7 +1172,6 @@ async def aimodel_cmd(_, message: Message):
         await message.reply_text(f"✅ <b>Удалена:</b> <code>{html.escape(removed)}</code>")
         return
 
-    # Выбор по номеру
     arg = args[1]
     try:
         idx = int(arg) - 1
@@ -1212,13 +1185,12 @@ async def aimodel_cmd(_, message: Message):
     except ValueError:
         pass
 
-    # Выбор по имени
     if set_current_model(arg):
         await message.reply_text(f"✅ <b>Установлена:</b> <code>{html.escape(arg)}</code>")
 
 
 # ============================================================
-# .AITOKENS / .AILINKS / .AIIGNORE (FIX #6, #8, #9)
+# .AITOKENS / .AILINKS / .AIIGNORE
 # ============================================================
 
 @Client.on_message(filters.command("aitokens", prefix) & filters.me)
