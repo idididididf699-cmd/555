@@ -16,6 +16,7 @@
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,22 @@ from utils.db import db
 from utils.scripts import load_module, unload_module
 
 BASE_PATH = os.path.abspath(os.getcwd())
+CUSTOM_MODULES_PATH = os.path.join(BASE_PATH, "modules", "custom_modules")
+
+
+def safe_module_name(name: str) -> str:
+    """Turn a file/url-derived name into a valid importable module name."""
+    name = os.path.basename(name)
+    if name.endswith(".py"):
+        name = name[:-3]
+    name = re.sub(r"[^a-zA-Z0-9_]+", "_", name).strip("_").lower()
+    return name or "custom_module"
+
+
+def ensure_custom_modules_dir():
+    os.makedirs(CUSTOM_MODULES_PATH, exist_ok=True)
+
+
 CATEGORIES = [
     "ai",
     "dl",
@@ -69,6 +86,8 @@ async def get_mod_hash(_, message: Message):
 
 @Client.on_message(filters.command(["loadmod", "lm"], prefix) & filters.me)
 async def loadmod(client: Client, message: Message):
+    ensure_custom_modules_dir()
+
     if (
         not (
             message.reply_to_message
@@ -87,7 +106,7 @@ async def loadmod(client: Client, message: Message):
         if url.startswith(
             f"https://raw.githubusercontent.com/The-MoonTg-project/custom_modules/{modules_repo_branch}/"
         ):
-            module_name = url.split("/")[-1].split(".")[0]
+            module_name = safe_module_name(url.split("/")[-1])
         elif "." not in url:
             module_name = url.lower()
             try:
@@ -119,7 +138,7 @@ async def loadmod(client: Client, message: Message):
                     return
                 resp_content = await resp.read()
 
-            module_name = url.split("/")[-1].split(".")[0]
+            module_name = safe_module_name(url.split("/")[-1])
 
         async with aiohttp.ClientSession() as session, session.get(url) as resp:
             if resp.status != 200:
@@ -129,19 +148,23 @@ async def loadmod(client: Client, message: Message):
                 return
             resp_content = await resp.read()
 
-        if not os.path.exists(f"{BASE_PATH}/modules/custom_modules"):
-            os.mkdir(f"{BASE_PATH}/modules/custom_modules")
-
-        with open(f"./modules/custom_modules/{module_name}.py", "wb") as f:
+        module_name = safe_module_name(module_name)
+        with open(os.path.join(CUSTOM_MODULES_PATH, f"{module_name}.py"), "wb") as f:
             f.write(resp_content)
     else:
-        file_name = await message.reply_to_message.download()
-        module_name = message.reply_to_message.document.file_name[:-3]
-
-        with open(file_name, "rb") as f:
-            content = f.read()
-
-        os.rename(file_name, f"./modules/custom_modules/{module_name}.py")
+        await message.edit("<b>Downloading module...</b>")
+        try:
+            file_name = await message.reply_to_message.download()
+            module_name = safe_module_name(
+                message.reply_to_message.document.file_name
+            )
+            shutil.move(
+                file_name, os.path.join(CUSTOM_MODULES_PATH, f"{module_name}.py")
+            )
+        except Exception as e:
+            return await message.edit(
+                f"<b>Failed to save module file:</b>\n<code>{e}</code>"
+            )
 
     all_modules = db.get("custom.modules", "allModules", [])
     if module_name not in all_modules:
@@ -194,8 +217,7 @@ async def unload_mods(client: Client, message: Message):
 async def load_all_mods(client: Client, message: Message):
     await message.edit("<b>Fetching info...</b>")
 
-    if not os.path.exists(f"{BASE_PATH}/modules/custom_modules"):
-        os.mkdir(f"{BASE_PATH}/modules/custom_modules")
+    ensure_custom_modules_dir()
 
     try:
         async with (
@@ -260,8 +282,7 @@ async def unload_all_mods(client, message: Message):
 async def updateallmods(client, message: Message):
     await message.edit("<b>Updating modules...</b>")
 
-    if not os.path.exists(f"{BASE_PATH}/modules/custom_modules"):
-        os.mkdir(f"{BASE_PATH}/modules/custom_modules")
+    ensure_custom_modules_dir()
 
     modules_installed = list(os.walk("modules/custom_modules"))[0][2]
 

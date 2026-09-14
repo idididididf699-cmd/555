@@ -119,12 +119,12 @@ app = Client("my_account", **common_params)
 
 
 async def load_missing_modules():
+    custom_modules_path = f"{SCRIPT_PATH}/modules/custom_modules"
+    os.makedirs(custom_modules_path, exist_ok=True)
+
     all_modules = db.get("custom.modules", "allModules", [])
     if not all_modules:
         return
-
-    custom_modules_path = f"{SCRIPT_PATH}/modules/custom_modules"
-    os.makedirs(custom_modules_path, exist_ok=True)
 
     try:
         async with (
