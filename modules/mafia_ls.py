@@ -1,6 +1,6 @@
 # Moon-Userbot - telegram userbot
 # Mafia module for @TrueMafiaBlackBot (личные сообщения + своя игра)
-# Режим преследования (очередь целей) + авто-вход + мгновенный отклик
+# Режим преследования (очередь целей) + авто-вход + мгновенный отклик + детальный дебаг
 
 import asyncio
 import base64
@@ -112,6 +112,14 @@ def add_hunt_target(target):
     if target not in targets:
         targets.append(target)
         db.set("custom.mafia_ls", "hunt_targets", targets)
+
+def remove_hunt_target(target):
+    targets = get_hunt_targets()
+    if target in targets:
+        targets.remove(target)
+        db.set("custom.mafia_ls", "hunt_targets", targets)
+        return True
+    return False
 
 def clear_hunt_targets():
     db.set("custom.mafia_ls", "hunt_targets", [])
@@ -331,14 +339,24 @@ async def _get_self_id(client):
         return None
 
 def _find_slot_for_target(target_id, roster):
-    if isinstance(target_id, int) and target_id < 100:
+    if isinstance(target_id, int) and 1 <= target_id <= 20:
         return target_id
-
     if isinstance(roster, dict):
-        if str(target_id) in roster:
-            return roster[str(target_id)]
-        if int(target_id) in roster:
-            return roster[int(target_id)]
+        str_key = str(target_id)
+        if str_key in roster:
+            return roster[str_key]
+        try:
+            int_key = int(target_id)
+            if int_key in roster:
+                return roster[int_key]
+            for k, v in roster.items():
+                try:
+                    if int(k) == int_key or int(v) == int_key:
+                        return int(v) if int(k) == int_key else int(k)
+                except (ValueError, TypeError):
+                    continue
+        except (ValueError, TypeError):
+            pass
     elif isinstance(roster, list):
         target_int = int(target_id) if str(target_id).isdigit() else target_id
         if target_int in roster:
@@ -410,31 +428,45 @@ def _find_hunt_button(buttons, targets, roster, self_id):
     for target_id in targets:
         slot = _find_slot_for_target(target_id, roster)
         if slot is None:
+            _dbg(f"⚠️ Слот для цели {target_id} не найден в ростере")
             continue
 
         candidates = []
         for bt, data in buttons:
             if DANGER_RE.search(bt):
                 continue
-            if _btn_slot(data, bt) != slot:
+            btn_slot = _btn_slot(data, bt)
+            if btn_slot != slot:
                 continue
             candidates.append((bt, data))
 
         if not candidates:
+            _dbg(f"⚠️ Кнопки для слота #{slot} (цель {target_id}) не найдены")
             continue
+
+        chosen = None
+        reason = ""
 
         if role and (MANIAC_ROLE_RE.search(role) or MAFIA_ROLE_RE.search(role)):
             for bt, data in candidates:
                 act = (_btn_action(data) or "").lower()
                 if MANIAC_ROLE_RE.search(role) and ("kill" in act or "убит" in act):
-                    return (bt, data), f"Охота (Маньяк kill -> слот #{slot})"
+                    chosen = (bt, data)
+                    reason = f"Охота (Маньяк kill -> слот #{slot}, цель {target_id})"
+                    break
                 if MAFIA_ROLE_RE.search(role) and ("vote" in act or "lynch" in act or "убит" in act):
-                    return (bt, data), f"Охота (Мафия vote -> слот #{slot})"
+                    chosen = (bt, data)
+                    reason = f"Охота (Мафия vote -> слот #{slot}, цель {target_id})"
+                    break
 
-        chosen = random.choice(candidates)
-        return chosen, f"Охота (Слот #{slot})"
+        if not chosen:
+            chosen = random.choice(candidates)
+            reason = f"Охота (Слот #{slot}, цель {target_id})"
 
-    return None, "Ни одна из целей не найдена (возможно, все мертвы)"
+        if chosen:
+            return chosen, reason
+
+    return None, f"Цели {targets} не найдены в ростере {list(roster.keys())[:5]}..."
 
 # ============================================
 # МЕНЮ ВЫБОРА ЦЕЛИ
@@ -815,12 +847,17 @@ async def mafia_hunt(client, message):
         await _start_picker_flow(client, message)
         return
 
-    if low in ("off", "none", "0", "выкл", "убр", "-"):
+    if low in ("off", "none", "0", "выкл", "убр"):
         set_hunt_mode(False)
         clear_hunt_targets()
         await message.reply_text("🔕 Режим преследования отключён, очередь очищена.")
         await _log_to_chat(client, "Режим преследования", "Охота отключена пользователем")
         return
+
+    is_remove = False
+    if low.startswith("rm ") or low.startswith("del ") or low.startswith("- "):
+        is_remove = True
+        raw = raw.split(maxsplit=1)[1].strip()
 
     target = None
 
@@ -828,7 +865,17 @@ async def mafia_hunt(client, message):
         val = int(raw)
         if val < 100:
             found_uid = None
-            for gid, r_data in get_roster_map().items():
+            
+            # Приоритет 1: Текущий чат и последняя игра
+            priority_gids = []
+            if message.chat:
+                priority_gids.append(message.chat.id)
+            lgg = get_last_game_group()
+            if lgg and lgg not in priority_gids:
+                priority_gids.append(lgg)
+                
+            for gid in priority_gids:
+                r_data = get_roster_for_group(gid)
                 if isinstance(r_data, dict):
                     for uid, slot_num in r_data.items():
                         if int(slot_num) == val:
@@ -837,11 +884,22 @@ async def mafia_hunt(client, message):
                 if found_uid:
                     break
             
+            # Приоритет 2 (фоллбек): Ищем по всем старым сохраненным ростерам
+            if not found_uid:
+                for gid, r_data in get_roster_map().items():
+                    if isinstance(r_data, dict):
+                        for uid, slot_num in r_data.items():
+                            if int(slot_num) == val:
+                                found_uid = int(uid)
+                                break
+                    if found_uid:
+                        break
+            
             if found_uid:
                 target = found_uid
                 await message.reply_text(f"🔍 Слот #{val} преобразован в Telegram ID: <code>{target}</code>")
             else:
-                await message.reply_text(f"❌ Не удалось найти ID игрока на слоте #{val} в текущем ростере.")
+                await message.reply_text(f"❌ Не удалось найти ID игрока на слоте #{val} в ростере.")
                 return
         else:
             target = val
@@ -863,6 +921,14 @@ async def mafia_hunt(client, message):
         )
         return
 
+    # Логика удаления одной цели
+    if is_remove:
+        if remove_hunt_target(target):
+            await message.reply_text(f"🗑 Цель <code>{target}</code> удалена из очереди.\nТекущая очередь: <code>{get_hunt_targets()}</code>")
+        else:
+            await message.reply_text(f"⚠️ Цель <code>{target}</code> не найдена в очереди.")
+        return
+
     add_hunt_target(target)
     set_hunt_mode(True)
     targets_list = get_hunt_targets()
@@ -875,8 +941,34 @@ async def mafia_hunt(client, message):
         f"Текущая очередь: <code>{targets_list}</code>\n"
         f"Роль: <b>{role}</b>\n"
         f"Действие: <code>{action}</code>\n\n"
-        f"<i>{prefix}mafiahunt off</i> — очистить и отключить"
+        f"<i>{prefix}mafiahunt rm {raw}</i> — удалить эту цель\n"
+        f"<i>{prefix}mafiahunt off</i> — очистить всё и отключить"
     )
+
+@Client.on_message(filters.command("mafiastatus", prefix) & filters.me)
+async def mafia_status(client, message):
+    targets = get_hunt_targets()
+    hunt = get_hunt_mode()
+    role = get_my_role()
+    last_group = get_last_game_group()
+    roster = get_roster_for_group(last_group) if last_group else {}
+    
+    status = (
+        f"🎯 <b>Статус охоты:</b>\n"
+        f"• Режим: {'✅ Вкл' if hunt else '❌ Выкл'}\n"
+        f"• Цели: <code>{targets or '—'}</code>\n"
+        f"• Роль: <b>{role or 'не определена'}</b>\n"
+        f"• Последняя группа: <code>{last_group or '—'}</code>\n"
+        f"• Игроков в ростере: {len(roster)}\n\n"
+    )
+    
+    if roster and targets:
+        status += "🔍 <b>Слоты целей:</b>\n"
+        for t in targets:
+            slot = _find_slot_for_target(t, roster)
+            status += f"• Цель <code>{t}</code> → слот #{slot or '???'}\n"
+    
+    await message.reply_text(status)
 
 @Client.on_message(filters.command("mafiarole", prefix) & filters.me)
 async def mafia_role_cmd(client, message):
@@ -1104,6 +1196,8 @@ async def mafia_ls_handler(client, message):
             raise ContinuePropagation
 
         if hunt_mode and hunt_targets:
+            _dbg(f"🎯 Режим охоты активен. Цели: {hunt_targets}")
+            
             candidates_keys = []
             if btns:
                 gid = _btn_group(btns[0][1])
@@ -1119,7 +1213,6 @@ async def mafia_ls_handler(client, message):
                 if key is None:
                     continue
                 stored = get_roster_for_group(key)
-                # Проверяем, есть ли хотя бы одна цель из списка в этом ростере
                 target_found = any(_find_slot_for_target(t, stored) is not None for t in hunt_targets)
                 if stored and target_found:
                     roster = stored
@@ -1131,16 +1224,25 @@ async def mafia_ls_handler(client, message):
                         roster = r_map
                         break
 
+            if not roster:
+                _dbg(f"⚠️ Ростер не найден для целей {hunt_targets}")
+                _dbg(f"Доступные ростеры: {list(get_roster_map().keys())}")
+            else:
+                _dbg(f"✅ Используем ростер: {roster}")
+
             self_id = await _get_self_id(client)
             btn, reason = _find_hunt_button(btns, hunt_targets, roster, self_id)
+            
             if btn:
                 bt, data = btn
-                _dbg(f"🎯 клик по цели: {bt!r}")
+                _dbg(f"🎯 Найдена кнопка цели: {bt!r}, причина: {reason}")
                 await asyncio.sleep(random.uniform(0.5, 1.2))
                 await _force_click(client, message, bt, data, reason=reason)
                 raise ContinuePropagation
+            else:
+                _dbg(f"❌ Кнопка не найдена. Доступные кнопки: {[(bt, _btn_slot(d, bt)) for bt, d in btns]}")
+                _dbg(f"🔍 Искали слоты для целей: {[_find_slot_for_target(t, roster) for t in hunt_targets]}")
 
-            _dbg_on("🦥 AFK: кнопка цели не найдена, ход пропущен")
             raise ContinuePropagation
 
         raise ContinuePropagation
@@ -1200,8 +1302,10 @@ async def mafia_roster_collector(client, message):
 modules_help["mafia_ls"] = {
     "mafiahunt": "Показать текущую очередь целей",
     "mafiahunt pick": "Меню выбора цели из ростера",
-    "mafiahunt <@ник|номер_слота|id>": "Добавить цель в очередь на убийство (номер слота сам найдет ID в ростере)",
+    "mafiahunt <@ник|номер_слота|id>": "Добавить цель в очередь на убийство",
+    "mafiahunt rm <цель>": "Удалить конкретную цель из очереди (по слоту или юзернейму)",
     "mafiahunt off": "Очистить список целей и отключить преследование",
+    "mafiastatus": "Показать детальный статус режима охоты",
     "mafiarole [maniac|mafia]": "Установить роль вручную",
     "mafiaroster": "Показать списки игроков по группам и список целей",
     "mafialogchat <chat_id>": "Настроить чат для логов (по умолч. -5276889918)",
