@@ -440,8 +440,11 @@ def _find_hunt_button(buttons, targets, roster, self_id):
 # МЕНЮ ВЫБОРА ЦЕЛИ
 # ============================================
 
-_PICK_WINDOW = 180
+_PICK_WINDOW = 300
 _PICK_PER_ROW = 5
+_PICK_DONE = "✅ Готово"
+_PICK_CANCEL = "❌"
+_PICK_LOCK = asyncio.Lock()
 
 def _get_pick_menu():
     data = db.get("custom.mafia_ls", "pick_menu", None)
@@ -566,7 +569,37 @@ async def _resolve_picker_source(client, message):
         return ("groups", None, {g: r for g, r in stored})
     return ("none", None, {})
 
-async def _open_player_picker(client, message, gid, roster, known_names=None):
+def _picker_keyboard(entries, kind):
+    keyboard = _chunk([KeyboardButton(str(slot)) for slot, _ in entries], _PICK_PER_ROW)
+    if kind == "players":
+        keyboard.append([KeyboardButton(_PICK_DONE), KeyboardButton(_PICK_CANCEL)])
+    else:
+        keyboard.append([KeyboardButton(_PICK_CANCEL)])
+    return keyboard
+
+
+def _player_picker_text(gid, entries, names, selected):
+    selected_set = set(selected)
+    text = (
+        f"🎯 <b>Выбор целей охоты (мультивыбор)</b>\n"
+        f"👥 Чат: <code>{gid}</code> • игроков: {len(entries)}\n\n"
+    )
+    for slot, uid in entries:
+        mark = "✅" if uid in selected_set else "▫️"
+        text += (
+            f"{mark} <b>{slot}.</b> "
+            f"{html.escape(names.get(uid, f'ID {uid}'))}\n"
+        )
+    text += (
+        f"\n<b>Выбрано: {len(selected_set)}</b>\n"
+        "Нажимай номера: повторное нажатие снимает выбор.\n"
+        f"Потом нажми <b>{_PICK_DONE}</b> • ❌ — отмена\n"
+        f"⏳ Меню активно {_PICK_WINDOW // 60} мин."
+    )
+    return text
+
+
+async def _open_player_picker(client, message, gid, roster, known_names=None, preset=None):
     await _delete_pick_menu_msg(client, _get_pick_menu())
     names = await _resolve_names(client, list(roster.keys()), known_names)
     entries = []
@@ -580,21 +613,15 @@ async def _open_player_picker(client, message, gid, roster, known_names=None):
         await message.reply_text("❌ В ростере нет игроков с номерами.")
         return
 
-    text = (
-        f"🎯 <b>Выбор цели охоты</b>\n"
-        f"👥 Чат: <code>{gid}</code> • игроков: {len(entries)}\n\n"
-    )
-    for slot, uid in entries:
-        text += f"<b>{slot}.</b> {html.escape(names.get(uid, f'ID {uid}'))}\n"
-    text += (
-        f"\nНажми номер на клавиатуре или ответь номером.\n"
-        f"⏳ Меню активно {_PICK_WINDOW // 60} мин. • ❌ — отмена"
-    )
+    # уже стоящие в очереди цели этого ростера помечаем выбранными
+    if preset is None:
+        preset = [u for u in get_hunt_targets() if u in {uid for _, uid in entries}]
+    selected = [int(u) for u in preset if isinstance(u, int) or str(u).lstrip("-").isdigit()]
 
-    keyboard = _chunk([KeyboardButton(str(slot)) for slot, _ in entries], _PICK_PER_ROW)
-    keyboard.append([KeyboardButton("❌")])
+    text = _player_picker_text(gid, entries, names, selected)
+    keyboard = _picker_keyboard(entries, "players")
     menu = await client.send_message(
-        "me", text, reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        "me", text, reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
     )
     _set_pick_menu({
         "chat_id": menu.chat.id,
@@ -603,10 +630,105 @@ async def _open_player_picker(client, message, gid, roster, known_names=None):
         "gid": gid,
         "slots": {str(slot): uid for slot, uid in entries},
         "names": {str(uid): names.get(uid, f"ID {uid}") for _, uid in entries},
+        "selected": selected,
         "ts": time.time(),
     })
     try:
         await message.delete()
+    except Exception:
+        pass
+
+
+async def _refresh_player_picker(client, menu):
+    entries = sorted(
+        ((int(slot), int(uid)) for slot, uid in menu.get("slots", {}).items()),
+        key=lambda x: x[0],
+    )
+    names = menu.get("names", {})
+    selected = menu.get("selected", [])
+    text = _player_picker_text(menu.get("gid"), entries, names, selected)
+    keyboard = _picker_keyboard(entries, "players")
+    try:
+        await client.edit_message_text(
+            menu["chat_id"], menu["msg_id"], text, reply_markup=keyboard
+        )
+    except Exception:
+        pass
+
+
+async def _toggle_pick(client, message, menu, slot, is_reply):
+    slots = menu.get("slots", {})
+    value = slots.get(str(slot))
+    if value is None:
+        if is_reply:
+            try:
+                avail = ", ".join(sorted(slots.keys(), key=lambda x: int(x) if str(x).isdigit() else 0))
+                await message.reply_text(f"❌ Номера <code>{html.escape(str(slot))}</code> нет в меню. Доступны: {avail or '—'}")
+            except Exception:
+                pass
+        return
+
+    try:
+        uid = int(value)
+    except (TypeError, ValueError):
+        return
+
+    selected = list(menu.get("selected", []))
+    if uid in selected:
+        selected.remove(uid)
+    else:
+        selected.append(uid)
+    menu["selected"] = selected
+    menu["ts"] = time.time()
+    _set_pick_menu(menu)
+
+    await _refresh_player_picker(client, menu)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def _finalize_pick(client, message, menu):
+    selected = list(menu.get("selected", []))
+    names = menu.get("names", {}) or {}
+
+    # мержим с уже существующей очередью, сохраняя порядок добавления
+    targets = list(get_hunt_targets())
+    for uid in selected:
+        if uid not in targets:
+            targets.append(uid)
+    db.set("custom.mafia_ls", "hunt_targets", targets)
+    set_hunt_mode(True)
+
+    role = get_my_role() or "автоопределение"
+    action = "kill" if MANIAC_ROLE_RE.search(role) else "mafia_vote" if MAFIA_ROLE_RE.search(role) else "авто"
+
+    await _delete_pick_menu_msg(client, menu)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    _clear_pick_menu()
+
+    if selected:
+        lines = "\n".join(
+            f"• <b>{html.escape(str(names.get(str(uid)) or names.get(uid) or f'ID {uid}'))}</b> "
+            f"(<code>{uid}</code>)"
+            for uid in selected
+        )
+    else:
+        lines = "<i>в этом меню ничего не выбрано</i>"
+    confirm = (
+        "🎯 <b>Очередь целей обновлена!</b>\n"
+        f"{lines}\n\n"
+        f"Вся очередь (<b>{len(targets)}</b>): <code>{targets}</code>\n"
+        f"Роль: <b>{html.escape(role)}</b> • Действие: <code>{action}</code>\n\n"
+        f"⚡ Охота активна до конца игры\n"
+        f"<i>{prefix}mafiahunt off</i> — очистить список и отключить"
+    )
+    try:
+        await client.send_message("me", confirm, reply_markup=ReplyKeyboardRemove())
     except Exception:
         pass
 
@@ -662,7 +784,7 @@ async def _start_picker_flow(client, message):
             f"• Или дождись ростера в группе"
         )
 
-async def _apply_picker_choice(client, message, menu, slot, is_reply):
+async def _choose_group_pick(client, message, menu, slot, is_reply):
     slots = menu.get("slots", {})
     value = slots.get(str(slot))
     if value is None:
@@ -674,58 +796,21 @@ async def _apply_picker_choice(client, message, menu, slot, is_reply):
                 pass
         return
 
-    if menu.get("kind") == "groups":
-        roster = get_roster_for_group(value)
-        if not roster:
-            _clear_pick_menu()
-            try:
-                await message.reply_text("📭 Ростер этого чата пуст.")
-            except Exception:
-                pass
-            return
-        await _delete_pick_menu_msg(client, menu)
-        await _open_player_picker(client, message, value, roster)
-        return
-
-    try:
-        uid = int(value)
-    except (TypeError, ValueError):
-        return
-    uname = (menu.get("names", {}) or {}).get(str(uid), "")
-    if not uname:
+    roster = get_roster_for_group(value)
+    if not roster:
+        _clear_pick_menu()
         try:
-            user = await client.get_users(uid)
-            uname = (user.first_name or "").strip() if user else ""
+            await message.reply_text("📭 Ростер этого чата пуст.")
         except Exception:
-            uname = ""
-    if not uname:
-        uname = f"ID {uid}"
-
-    add_hunt_target(uid)
-    set_hunt_mode(True)
-    role = get_my_role() or "автоопределение"
-    action = "kill" if MANIAC_ROLE_RE.search(role) else "mafia_vote" if MAFIA_ROLE_RE.search(role) else "авто"
-
+            pass
+        return
     await _delete_pick_menu_msg(client, menu)
+    _clear_pick_menu()
     try:
         await message.delete()
     except Exception:
         pass
-    _clear_pick_menu()
-
-    targets_list = get_hunt_targets()
-    confirm = (
-        f"🎯 <b>Цель добавлена в очередь!</b>\n"
-        f"Игрок: <b>{html.escape(uname)}</b> (ID: <code>{uid}</code>)\n"
-        f"Очередь целей: <code>{targets_list}</code>\n"
-        f"Роль: <b>{html.escape(role)}</b> • Действие: <code>{action}</code>\n\n"
-        f"⚡ Охота активна до конца игры\n"
-        f"<i>{prefix}mafiahunt off</i> — очистить список и отключить"
-    )
-    try:
-        await client.send_message("me", confirm, reply_markup=ReplyKeyboardRemove())
-    except Exception:
-        pass
+    await _open_player_picker(client, message, value, roster)
 
 async def _cancel_picker(client, message, menu):
     await _delete_pick_menu_msg(client, menu)
@@ -1035,13 +1120,33 @@ async def mafia_pick_watcher(client, message):
             raise ContinuePropagation
 
         if text in ("❌", "❌ Отмена"):
-            await _cancel_picker(client, message, menu)
+            async with _PICK_LOCK:
+                if _get_pick_menu() is menu:
+                    await _cancel_picker(client, message, menu)
             raise ContinuePropagation
 
-        if not text.isdigit():
+        is_done = text == _PICK_DONE or text.startswith("✅")
+
+        if not text.isdigit() and not is_done:
             raise ContinuePropagation
 
-        await _apply_picker_choice(client, message, menu, text, is_reply)
+        # Сериализуем обработку быстрых последовательных нажатий:
+        # воркеры pyrogram обрабатывают апдейты конкурентно.
+        async with _PICK_LOCK:
+            menu = _get_pick_menu()
+            if not menu or message.chat.id != menu.get("chat_id"):
+                raise ContinuePropagation
+            kind = menu.get("kind")
+
+            if is_done:
+                if kind == "players":
+                    await _finalize_pick(client, message, menu)
+                raise ContinuePropagation
+
+            if kind == "groups":
+                await _choose_group_pick(client, message, menu, text, is_reply)
+            else:
+                await _toggle_pick(client, message, menu, text, is_reply)
         raise ContinuePropagation
     except ContinuePropagation:
         raise
@@ -1114,22 +1219,37 @@ async def mafia_ls_handler(client, message):
                 candidates_keys.append(lgg)
             candidates_keys.append(message.chat.id)
 
-            roster = {}
+            def _matched_targets(stored):
+                return [
+                    t for t in hunt_targets
+                    if _find_slot_for_target(t, stored) is not None
+                ]
+
+            # Сначала приоритетные чаты (группа из кнопки, последняя игра, ЛС),
+            # затем все сохранённые ростеры. Выбираем ростер с МАКСИМАЛЬНЫМ
+            # числом совпадений целей, чтобы цели из другой игры не «съедали»
+            # выбор в текущей игре.
+            best_roster = {}
+            best_count = 0
+
             for key in candidates_keys:
                 if key is None:
                     continue
                 stored = get_roster_for_group(key)
-                # Проверяем, есть ли хотя бы одна цель из списка в этом ростере
-                target_found = any(_find_slot_for_target(t, stored) is not None for t in hunt_targets)
-                if stored and target_found:
-                    roster = stored
-                    break
-            
-            if not roster:
-                for _, r_map in get_roster_map().items():
-                    if any(_find_slot_for_target(t, r_map) is not None for t in hunt_targets):
-                        roster = r_map
-                        break
+                if stored:
+                    count = len(_matched_targets(stored))
+                    if count > best_count:
+                        best_count = count
+                        best_roster = stored
+
+            if not best_roster:
+                for r_map in get_roster_map().values():
+                    count = len(_matched_targets(r_map))
+                    if count > best_count:
+                        best_count = count
+                        best_roster = r_map
+
+            roster = best_roster
 
             self_id = await _get_self_id(client)
             btn, reason = _find_hunt_button(btns, hunt_targets, roster, self_id)
@@ -1199,7 +1319,7 @@ async def mafia_roster_collector(client, message):
 
 modules_help["mafia_ls"] = {
     "mafiahunt": "Показать текущую очередь целей",
-    "mafiahunt pick": "Меню выбора цели из ростера",
+    "mafiahunt pick": "Меню мультивыбора целей из ростера (номера - выбор/снятие, ✅ Готово - подтвердить)",
     "mafiahunt <@ник|номер_слота|id>": "Добавить цель в очередь на убийство (номер слота сам найдет ID в ростере)",
     "mafiahunt off": "Очистить список целей и отключить преследование",
     "mafiarole [maniac|mafia]": "Установить роль вручную",
