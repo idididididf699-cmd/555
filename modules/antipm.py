@@ -187,7 +187,7 @@ async def add_contact(_, message: Message):
     await message.edit("User Approved!")
 
 
-@Client.on_message(filters.command(["d"], prefix) & filters.me)
+@Client.on_message(filters.command(["disapprove", "deny"], prefix) & filters.me)
 async def del_contact(_, message: Message):
     ids = message.chat.id
 
@@ -263,5 +263,5 @@ modules_help["antipm"] = {
     "setantipmpic [reply to photo]*": "Set antipm picture.",
     "sap [reply to photo]*": "Set antipm picture.",
     "a": "Approve User",
-    "d": "DisApprove User",
+    "disapprove | deny": "Disapprove User",
 }

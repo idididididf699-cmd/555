@@ -23,7 +23,6 @@ from pyrogram.errors import (
     RPCError,
     UserAdminInvalid,
 )
-from pyrogram.raw import functions
 from pyrogram.types import ChatPermissions, Message
 
 from utils import modules_help, prefix
@@ -127,19 +126,6 @@ async def admintool_handler(_, message: Message):
     raise ContinuePropagation
 
 
-async def get_user_and_name(message):
-    if message.reply_to_message.from_user:
-        return (
-            message.reply_to_message.from_user.id,
-            message.reply_to_message.from_user.first_name,
-        )
-    if message.reply_to_message.sender_chat:
-        return (
-            message.reply_to_message.sender_chat.id,
-            message.reply_to_message.sender_chat.title,
-        )
-
-
 @Client.on_message(filters.command(["ban"], prefix) & filters.me)
 async def ban_command(client: Client, message: Message):
     handler = BanHandler(client, message)
@@ -219,27 +205,6 @@ async def anti_channels(client: Client, message: Message):
 async def delete_history(client: Client, message: Message):
     handler = DeleteHistoryHandler(client, message)
     await handler.handle_delete_history()
-
-
-@Client.on_message(filters.command(["report_spam", "rs"], prefix))
-@with_reply
-async def report_spam(client: Client, message: Message):
-    try:
-        channel = await client.resolve_peer(message.chat.id)
-
-        user_id, name = await get_user_and_name(message)
-        peer = await client.resolve_peer(user_id)
-        await client.invoke(
-            functions.channels.ReportSpam(
-                channel=channel,
-                participant=peer,
-                id=[message.reply_to_message.id],
-            )
-        )
-    except Exception as e:
-        await message.edit(format_exc(e))
-    else:
-        await message.edit(f"<b>Message</a> from {name} was reported</b>")
 
 
 @Client.on_message(filters.command("pin", prefix) & filters.me)
@@ -369,7 +334,6 @@ modules_help["admintool"] = {
     "tmute_users": "list of tmuted (.tmute) users",
     "antich [enable/disable]": "turn on/off blocking channels in this chat",
     "delete_history [reply]/[username/id]* [reason]": "delete history from member in chat",
-    "report_spam [reply]*": "report spam message in chat",
     "pin [reply]*": "Pin replied message",
     "unpin [reply]*": "Unpin replied message",
     "ro": "enable read-only mode",
